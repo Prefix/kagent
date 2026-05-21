@@ -63,6 +63,17 @@ type RemoteMCPServerSpec struct {
 	// See: https://gateway-api.sigs.k8s.io/guides/multiple-ns/#cross-namespace-routing
 	// +optional
 	AllowedNamespaces *AllowedNamespaces `json:"allowedNamespaces,omitempty"`
+
+	// TLS configuration for the upstream MCP server connection.
+	// Use this for HTTPS upstreams that present a certificate the agent's
+	// system trust store does not include (corporate CA, self-signed cert
+	// on a test fixture, internal MCP gateway). Reuses the same TLSConfig
+	// type as ModelConfig.spec.tls, with identical semantics: disableVerify
+	// turns off certificate validation entirely, caCertSecretRef +
+	// caCertSecretKey point at a PEM bundle Secret in the same namespace,
+	// and disableSystemCAs trusts only the named bundle.
+	// +optional
+	TLS *TLSConfig `json:"tls,omitempty"`
 }
 
 var _ sql.Scanner = (*RemoteMCPServerSpec)(nil)

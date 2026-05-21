@@ -3,6 +3,8 @@ package reconciler
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	reconcilerutils "github.com/kagent-dev/kagent/go/core/internal/controller/reconciler/utils"
 	"github.com/kagent-dev/kagent/go/core/internal/controller/translator"
 	"github.com/kagent-dev/kagent/go/core/pkg/sandboxbackend"
+	pkgtranslator "github.com/kagent-dev/kagent/go/core/pkg/translator"
 	"github.com/kagent-dev/kmcp/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -90,23 +93,30 @@ type kagentReconciler struct {
 	watchedNamespaces []string
 
 	sandboxBackend sandboxbackend.Backend
+
+	// rmsURLRewriter optionally transforms the URL the controller dials
+	// when discovering tools on a RemoteMCPServer. Nil means dial
+	// s.Spec.URL verbatim. See pkgtranslator.RemoteMCPServerURLRewriter.
+	rmsURLRewriter pkgtranslator.RemoteMCPServerURLRewriter
 }
 
 func NewKagentReconciler(
-	translator agent_translator.AdkApiTranslator,
+	adkTranslator agent_translator.AdkApiTranslator,
 	kube client.Client,
 	dbClient database.Client,
 	defaultModelConfig types.NamespacedName,
 	watchedNamespaces []string,
 	sandboxBackend sandboxbackend.Backend,
+	rmsURLRewriter pkgtranslator.RemoteMCPServerURLRewriter,
 ) KagentReconciler {
 	return &kagentReconciler{
-		adkTranslator:      translator,
+		adkTranslator:      adkTranslator,
 		kube:               kube,
 		dbClient:           dbClient,
 		defaultModelConfig: defaultModelConfig,
 		watchedNamespaces:  watchedNamespaces,
 		sandboxBackend:     sandboxBackend,
+		rmsURLRewriter:     rmsURLRewriter,
 	}
 }
 
@@ -1028,35 +1038,125 @@ func (a *kagentReconciler) createMcpTransport(ctx context.Context, s *v1alpha2.R
 		return nil, err
 	}
 
-	httpClient := newHTTPClient(headers, remoteMCPRegistrationTimeout(s))
+	// Resolve the dial-time URL. Default is s.Spec.URL; an installed
+	// rmsURLRewriter may substitute a different dial target. The
+	// rewriter controls the URL only — tlsConfig below is built from
+	// s.Spec.TLS regardless of what the rewriter returns, so rewriting
+	// http:// → https:// to a destination needing different trust
+	// roots is not supported (s.Spec.TLS would need to already be
+	// consistent with the new destination).
+	endpoint := s.Spec.URL
+	if a.rmsURLRewriter != nil {
+		rewritten, err := a.rmsURLRewriter.RewriteRemoteMCPServerURL(ctx, s)
+		if err != nil {
+			return nil, fmt.Errorf("failed to rewrite RemoteMCPServer URL for %s/%s: %w", s.Namespace, s.Name, err)
+		}
+		endpoint = rewritten
+	}
+
+	tlsConfig, err := a.buildRemoteMCPServerTLSConfig(ctx, s)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build TLS config for %s/%s: %w", s.Namespace, s.Name, err)
+	}
+
+	httpClient := newHTTPClient(headers, remoteMCPRegistrationTimeout(s), tlsConfig)
 
 	switch s.Spec.Protocol {
 	case v1alpha2.RemoteMCPServerProtocolSse:
 		return &mcp.SSEClientTransport{
-			Endpoint:   s.Spec.URL,
+			Endpoint:   endpoint,
 			HTTPClient: httpClient,
 		}, nil
 	default:
 		return &mcp.StreamableClientTransport{
-			Endpoint:   s.Spec.URL,
+			Endpoint:   endpoint,
 			HTTPClient: httpClient,
 		}, nil
 	}
 }
 
+// buildRemoteMCPServerTLSConfig returns a *tls.Config matching the
+// RemoteMCPServer's spec.tls (or nil when no TLS config is present, so
+// the http.Client falls back to Go's default transport with the system
+// trust store). Mirrors the per-source TLS semantics the agent
+// translator emits — disableVerify, custom CA from a Secret, and
+// disableSystemCAs trust-only-the-named-bundle — so tool discovery
+// trusts the same upstream chain the agent will trust at runtime.
+func (a *kagentReconciler) buildRemoteMCPServerTLSConfig(ctx context.Context, s *v1alpha2.RemoteMCPServer) (*tls.Config, error) {
+	tlsSpec := s.Spec.TLS
+	if tlsSpec.IsEmpty() {
+		return nil, nil
+	}
+
+	cfg := &tls.Config{
+		InsecureSkipVerify: tlsSpec.DisableVerify, //nolint:gosec // operator-authored test-fixture escape hatch
+	}
+
+	if tlsSpec.CACertSecretRef != "" && tlsSpec.CACertSecretKey != "" {
+		secret := &corev1.Secret{}
+		if err := a.kube.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: tlsSpec.CACertSecretRef}, secret); err != nil {
+			return nil, fmt.Errorf("failed to read CA secret %s/%s: %w", s.Namespace, tlsSpec.CACertSecretRef, err)
+		}
+		pem, ok := secret.Data[tlsSpec.CACertSecretKey]
+		if !ok || len(pem) == 0 {
+			return nil, fmt.Errorf("CA secret %s/%s does not contain key %q", s.Namespace, tlsSpec.CACertSecretRef, tlsSpec.CACertSecretKey)
+		}
+
+		var pool *x509.CertPool
+		if tlsSpec.DisableSystemCAs {
+			pool = x509.NewCertPool()
+		} else {
+			sys, err := x509.SystemCertPool()
+			if err != nil {
+				return nil, fmt.Errorf("failed to load system CA pool: %w", err)
+			}
+			pool = sys
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("CA secret %s/%s key %q does not contain valid PEM certificates", s.Namespace, tlsSpec.CACertSecretRef, tlsSpec.CACertSecretKey)
+		}
+		cfg.RootCAs = pool
+	}
+	// Note: the trust-nothing combination (disableSystemCAs=true without
+	// caCertSecretRef and without disableVerify) is rejected by the CEL
+	// rule on TLSConfig at admission, so it cannot reach this code path
+	// in production.
+
+	return cfg, nil
+}
+
 // go-sdk does not have a WithHeaders option when initializing transport
-// so we need to create a custom HTTP client that adds headers to all requests.
-func newHTTPClient(headers map[string]string, timeout time.Duration) *http.Client {
+// so we need to create a custom HTTP client that adds headers to all
+// requests. When tlsConfig is non-nil it's installed on a cloned
+// transport so tool discovery honors RemoteMCPServer.spec.tls.
+func newHTTPClient(headers map[string]string, timeout time.Duration, tlsConfig *tls.Config) *http.Client {
+	var base http.RoundTripper = http.DefaultTransport
+	if tlsConfig != nil {
+		// Clone the default transport to preserve its dial/keepalive
+		// settings (proxies, dual-stack, HTTP/2) and override only the
+		// TLS config. If the default transport isn't *http.Transport
+		// (extremely unusual — only happens if something earlier swapped
+		// it out), fall back to a fresh transport so TLS still applies.
+		if t, ok := http.DefaultTransport.(*http.Transport); ok {
+			clone := t.Clone()
+			clone.TLSClientConfig = tlsConfig
+			base = clone
+		} else {
+			base = &http.Transport{TLSClientConfig: tlsConfig}
+		}
+	}
+
 	if len(headers) == 0 {
 		return &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: base,
 		}
 	}
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &headerTransport{
 			headers: headers,
-			base:    http.DefaultTransport,
+			base:    base,
 		},
 	}
 }

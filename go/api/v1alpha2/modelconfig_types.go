@@ -274,9 +274,14 @@ type SAPAICoreConfig struct {
 	AuthURL string `json:"authUrl,omitempty"`
 }
 
-// TLSConfig contains TLS/SSL configuration options for model provider connections.
-// This enables agents to connect to internal LiteLLM gateways or other providers
-// that use self-signed certificates or custom certificate authorities.
+// TLSConfig contains TLS/SSL configuration options for outbound HTTPS
+// connections from the agent (model provider, RemoteMCPServer). The
+// XValidation rules below apply at admission to every CRD field that
+// uses TLSConfig, so callers don't need to re-declare them per spec.
+//
+// +kubebuilder:validation:XValidation:message="caCertSecretKey requires caCertSecretRef",rule="!(has(self.caCertSecretKey) && size(self.caCertSecretKey) > 0 && (!has(self.caCertSecretRef) || size(self.caCertSecretRef) == 0))"
+// +kubebuilder:validation:XValidation:message="caCertSecretRef requires caCertSecretKey",rule="!(has(self.caCertSecretRef) && size(self.caCertSecretRef) > 0 && (!has(self.caCertSecretKey) || size(self.caCertSecretKey) == 0))"
+// +kubebuilder:validation:XValidation:message="disableSystemCAs requires caCertSecretRef or disableVerify (trust-nothing config rejects every upstream)",rule="!(has(self.disableSystemCAs) && self.disableSystemCAs && (!has(self.disableVerify) || !self.disableVerify) && (!has(self.caCertSecretRef) || size(self.caCertSecretRef) == 0))"
 type TLSConfig struct {
 	// DisableVerify disables SSL certificate verification entirely.
 	// When false (default), SSL certificates are verified.
@@ -310,6 +315,19 @@ type TLSConfig struct {
 	DisableSystemCAs bool `json:"disableSystemCAs,omitempty"`
 }
 
+// IsEmpty reports whether the TLSConfig carries any opinion. A nil
+// receiver and an all-zero struct are equivalent — both mean "no TLS
+// config supplied" and the consumer should fall back to its default
+// behavior (typically system trust store, default httpx client). The
+// single helper keeps callers from re-listing fields, so adding a new
+// field to TLSConfig only requires updating this method.
+func (t *TLSConfig) IsEmpty() bool {
+	if t == nil {
+		return true
+	}
+	return !t.DisableVerify && t.CACertSecretRef == "" && t.CACertSecretKey == "" && !t.DisableSystemCAs
+}
+
 // ModelConfigSpec defines the desired state of ModelConfig.
 //
 // +kubebuilder:validation:XValidation:message="provider.openAI must be nil if the provider is not OpenAI",rule="!(has(self.openAI) && self.provider != 'OpenAI')"
@@ -325,9 +343,6 @@ type TLSConfig struct {
 // +kubebuilder:validation:XValidation:message="apiKeySecretKey must be set if apiKeySecret is set (except for Bedrock and SAPAICore providers)",rule="!(has(self.apiKeySecret) && !has(self.apiKeySecretKey) && self.provider != 'Bedrock' && self.provider != 'SAPAICore')"
 // +kubebuilder:validation:XValidation:message="apiKeyPassthrough and apiKeySecret are mutually exclusive",rule="!(has(self.apiKeyPassthrough) && self.apiKeyPassthrough && has(self.apiKeySecret) && size(self.apiKeySecret) > 0)"
 // +kubebuilder:validation:XValidation:message="apiKeyPassthrough must be false if provider is Gemini;GeminiVertexAI;AnthropicVertexAI",rule="!(has(self.apiKeyPassthrough) && self.apiKeyPassthrough && (self.provider == 'Gemini' || self.provider == 'GeminiVertexAI' || self.provider == 'AnthropicVertexAI'))"
-// +kubebuilder:validation:XValidation:message="caCertSecretKey requires caCertSecretRef",rule="!(has(self.tls) && has(self.tls.caCertSecretKey) && size(self.tls.caCertSecretKey) > 0 && (!has(self.tls.caCertSecretRef) || size(self.tls.caCertSecretRef) == 0))"
-// +kubebuilder:validation:XValidation:message="caCertSecretKey requires caCertSecretRef (unless disableVerify is true)",rule="!(has(self.tls) && (!has(self.tls.disableVerify) || !self.tls.disableVerify) && has(self.tls.caCertSecretKey) && size(self.tls.caCertSecretKey) > 0 && (!has(self.tls.caCertSecretRef) || size(self.tls.caCertSecretRef) == 0))"
-// +kubebuilder:validation:XValidation:message="caCertSecretRef requires caCertSecretKey (unless disableVerify is true)",rule="!(has(self.tls) && (!has(self.tls.disableVerify) || !self.tls.disableVerify) && has(self.tls.caCertSecretRef) && size(self.tls.caCertSecretRef) > 0 && (!has(self.tls.caCertSecretKey) || size(self.tls.caCertSecretKey) == 0))"
 // +kubebuilder:validation:XValidation:message="openAI.tokenExchange requires apiKeySecret (the service account secret)",rule="!(has(self.openAI) && has(self.openAI.tokenExchange) && (!has(self.apiKeySecret) || size(self.apiKeySecret) == 0))"
 // +kubebuilder:validation:XValidation:message="openAI.tokenExchange and apiKeyPassthrough are mutually exclusive",rule="!(has(self.openAI) && has(self.openAI.tokenExchange) && has(self.apiKeyPassthrough) && self.apiKeyPassthrough)"
 // +kubebuilder:validation:XValidation:message="openAI.tokenExchange type GDCHServiceAccount requires openAI.tokenExchange.gdchServiceAccount",rule="!(has(self.openAI) && has(self.openAI.tokenExchange) && self.openAI.tokenExchange.type == 'GDCHServiceAccount' && !has(self.openAI.tokenExchange.gdchServiceAccount))"

@@ -179,6 +179,63 @@ spec:
               timeout:
                 default: 30s
                 type: string
+              tls:
+                description: |-
+                  TLS configuration for the upstream MCP server connection.
+                  Use this for HTTPS upstreams that present a certificate the agent's
+                  system trust store does not include (corporate CA, self-signed cert
+                  on a test fixture, internal MCP gateway). Reuses the same TLSConfig
+                  type as ModelConfig.spec.tls, with identical semantics: disableVerify
+                  turns off certificate validation entirely, caCertSecretRef +
+                  caCertSecretKey point at a PEM bundle Secret in the same namespace,
+                  and disableSystemCAs trusts only the named bundle.
+                properties:
+                  caCertSecretKey:
+                    description: |-
+                      CACertSecretKey is the key within the Secret that contains the CA certificate data.
+                      This field follows the same pattern as APIKeySecretKey.
+                      Required when CACertSecretRef is set (unless DisableVerify is true).
+                    type: string
+                  caCertSecretRef:
+                    description: |-
+                      CACertSecretRef is a reference to a Kubernetes Secret containing
+                      CA certificate(s) in PEM format. The Secret must be in the same
+                      namespace as the ModelConfig.
+                      When set, the certificate will be used to verify the provider's SSL certificate.
+                      This field follows the same pattern as APIKeySecret.
+                    type: string
+                  disableSystemCAs:
+                    default: false
+                    description: |-
+                      DisableSystemCAs disables the use of system CA certificates.
+                      When false (default), system CA certificates are used for verification (safe behavior).
+                      When true, only the custom CA from CACertSecretRef is trusted.
+                      This allows strict security policies where only corporate CAs should be trusted.
+                    type: boolean
+                  disableVerify:
+                    default: false
+                    description: |-
+                      DisableVerify disables SSL certificate verification entirely.
+                      When false (default), SSL certificates are verified.
+                      When true, SSL certificate verification is disabled.
+                      WARNING: This should ONLY be used in development/testing environments.
+                      Production deployments MUST use proper certificates.
+                    type: boolean
+                type: object
+                x-kubernetes-validations:
+                - message: caCertSecretKey requires caCertSecretRef
+                  rule: '!(has(self.caCertSecretKey) && size(self.caCertSecretKey)
+                    > 0 && (!has(self.caCertSecretRef) || size(self.caCertSecretRef)
+                    == 0))'
+                - message: caCertSecretRef requires caCertSecretKey
+                  rule: '!(has(self.caCertSecretRef) && size(self.caCertSecretRef)
+                    > 0 && (!has(self.caCertSecretKey) || size(self.caCertSecretKey)
+                    == 0))'
+                - message: disableSystemCAs requires caCertSecretRef or disableVerify
+                    (trust-nothing config rejects every upstream)
+                  rule: '!(has(self.disableSystemCAs) && self.disableSystemCAs &&
+                    (!has(self.disableVerify) || !self.disableVerify) && (!has(self.caCertSecretRef)
+                    || size(self.caCertSecretRef) == 0))'
               url:
                 minLength: 1
                 type: string

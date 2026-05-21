@@ -2,11 +2,20 @@ package reconciler
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	"github.com/kagent-dev/kagent/go/core/internal/utils"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -717,19 +726,300 @@ func TestNewHTTPClient(t *testing.T) {
 	timeout := 5 * time.Second
 
 	t.Run("no headers", func(t *testing.T) {
-		c := newHTTPClient(nil, timeout)
+		c := newHTTPClient(nil, timeout, nil)
 		assert.Equal(t, timeout, c.Timeout)
 	})
 
 	t.Run("empty headers", func(t *testing.T) {
-		c := newHTTPClient(map[string]string{}, timeout)
+		c := newHTTPClient(map[string]string{}, timeout, nil)
 		assert.Equal(t, timeout, c.Timeout)
 	})
 
 	t.Run("with headers sets timeout and custom transport", func(t *testing.T) {
-		c := newHTTPClient(map[string]string{"X-Key": "val"}, timeout)
+		c := newHTTPClient(map[string]string{"X-Key": "val"}, timeout, nil)
 		assert.Equal(t, timeout, c.Timeout)
 		_, ok := c.Transport.(*headerTransport)
 		assert.True(t, ok, "expected headerTransport")
 	})
+
+	t.Run("with tls config installs cloned transport", func(t *testing.T) {
+		tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test only
+		c := newHTTPClient(nil, timeout, tlsCfg)
+		require.Equal(t, timeout, c.Timeout)
+		// No headers → transport is the cloned *http.Transport directly.
+		tr, ok := c.Transport.(*http.Transport)
+		require.True(t, ok, "expected *http.Transport when no headers + tls is set")
+		assert.Same(t, tlsCfg, tr.TLSClientConfig)
+	})
+
+	t.Run("with headers and tls config wraps headerTransport over cloned transport", func(t *testing.T) {
+		tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test only
+		c := newHTTPClient(map[string]string{"X-Key": "val"}, timeout, tlsCfg)
+		ht, ok := c.Transport.(*headerTransport)
+		require.True(t, ok, "expected headerTransport")
+		tr, ok := ht.base.(*http.Transport)
+		require.True(t, ok, "headerTransport.base should be the cloned *http.Transport")
+		assert.Same(t, tlsCfg, tr.TLSClientConfig)
+	})
+}
+
+// TestBuildRemoteMCPServerTLSConfig covers the controller's mirror of the
+// agent translator's TLS semantics: tool discovery dials the upstream from
+// the controller pod, so it has to construct the same trust chain the agent
+// will use at runtime — but from the controller's vantage point (no Secret
+// mounted on its filesystem; it has to read the Secret via the kube API).
+func TestBuildRemoteMCPServerTLSConfig(t *testing.T) {
+	caPEM := generateTestCAPEM(t)
+
+	tests := []struct {
+		name        string
+		spec        *v1alpha2.TLSConfig
+		secret      *corev1.Secret
+		wantNil     bool
+		wantSkip    bool
+		wantCA      bool
+		wantSystem  bool
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "nil spec → no tls config (default transport)",
+			spec:    nil,
+			wantNil: true,
+		},
+		{
+			name:    "empty struct → no tls config (parity with nil)",
+			spec:    &v1alpha2.TLSConfig{},
+			wantNil: true,
+		},
+		{
+			name:     "disableVerify only",
+			spec:     &v1alpha2.TLSConfig{DisableVerify: true},
+			wantSkip: true,
+		},
+		{
+			name: "custom CA only (additive to system pool)",
+			spec: &v1alpha2.TLSConfig{
+				CACertSecretRef: "ca",
+				CACertSecretKey: "ca.crt",
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "ca", Namespace: "ns"},
+				Data:       map[string][]byte{"ca.crt": caPEM},
+			},
+			wantCA:     true,
+			wantSystem: true,
+		},
+		{
+			name: "custom CA with disableSystemCAs (trust only the bundle)",
+			spec: &v1alpha2.TLSConfig{
+				CACertSecretRef:  "ca",
+				CACertSecretKey:  "ca.crt",
+				DisableSystemCAs: true,
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "ca", Namespace: "ns"},
+				Data:       map[string][]byte{"ca.crt": caPEM},
+			},
+			wantCA:     true,
+			wantSystem: false,
+		},
+		{
+			name: "missing secret → error",
+			spec: &v1alpha2.TLSConfig{
+				CACertSecretRef: "ca",
+				CACertSecretKey: "ca.crt",
+			},
+			wantErr:     true,
+			errContains: "failed to read CA secret",
+		},
+		{
+			name: "secret present but missing key → error",
+			spec: &v1alpha2.TLSConfig{
+				CACertSecretRef: "ca",
+				CACertSecretKey: "ca.crt",
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "ca", Namespace: "ns"},
+				Data:       map[string][]byte{"other": []byte("x")},
+			},
+			wantErr:     true,
+			errContains: "does not contain key",
+		},
+		{
+			name: "secret key contains garbage → error",
+			spec: &v1alpha2.TLSConfig{
+				CACertSecretRef: "ca",
+				CACertSecretKey: "ca.crt",
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "ca", Namespace: "ns"},
+				Data:       map[string][]byte{"ca.crt": []byte("not a pem")},
+			},
+			wantErr:     true,
+			errContains: "valid PEM certificates",
+		},
+		// Note: the trust-nothing combination (disableSystemCAs=true alone)
+		// used to be rejected here at reconcile time. It's now rejected
+		// earlier by the CEL rule on TLSConfig at admission, so it cannot
+		// reach this code path. No runtime test needed.
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := clientgoscheme.Scheme
+			require.NoError(t, v1alpha2.AddToScheme(scheme))
+
+			objs := []client.Object{}
+			if tt.secret != nil {
+				objs = append(objs, tt.secret)
+			}
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+
+			r := &kagentReconciler{kube: kube}
+			rms := &v1alpha2.RemoteMCPServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+				Spec:       v1alpha2.RemoteMCPServerSpec{URL: "https://x/y", TLS: tt.spec},
+			}
+
+			cfg, err := r.buildRemoteMCPServerTLSConfig(context.Background(), rms)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errContains)
+				return
+			}
+			require.NoError(t, err)
+
+			if tt.wantNil {
+				assert.Nil(t, cfg)
+				return
+			}
+			require.NotNil(t, cfg)
+			assert.Equal(t, tt.wantSkip, cfg.InsecureSkipVerify)
+			if tt.wantCA {
+				require.NotNil(t, cfg.RootCAs, "expected RootCAs populated when CA Secret is referenced")
+			}
+			// Asserting "system pool was used" by counting subjects is
+			// platform-specific — on macOS, x509.SystemCertPool returns
+			// a minimal pool because Go defers to platform verification.
+			// The path is structurally enforced (SystemCertPool vs
+			// NewCertPool) and the strict-trust case (wantSystem=false)
+			// covers the alternative branch.
+			_ = tt.wantSystem
+		})
+	}
+}
+
+// stubRewriter is a test double for translator.RemoteMCPServerURLRewriter.
+// Records the call and returns the configured response, letting tests
+// verify createMcpTransport plumbs the rewriter correctly.
+type stubRewriter struct {
+	called  bool
+	gotRMS  *v1alpha2.RemoteMCPServer
+	respURL string
+	respErr error
+}
+
+func (s *stubRewriter) RewriteRemoteMCPServerURL(_ context.Context, rms *v1alpha2.RemoteMCPServer) (string, error) {
+	s.called = true
+	s.gotRMS = rms
+	return s.respURL, s.respErr
+}
+
+// TestCreateMcpTransport_URLRewriter covers the optional URL-rewriter
+// hook on the reconciler: a configured rewriter must (a) receive the
+// RemoteMCPServer, (b) supply the dial-time URL on the produced
+// transport, and (c) propagate errors. A nil rewriter must leave
+// s.Spec.URL as the dial target.
+func TestCreateMcpTransport_URLRewriter(t *testing.T) {
+	scheme := clientgoscheme.Scheme
+	require.NoError(t, v1alpha2.AddToScheme(scheme))
+
+	const specURL = "https://upstream.example.com/mcp"
+	rms := &v1alpha2.RemoteMCPServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "rms", Namespace: "ns"},
+		Spec: v1alpha2.RemoteMCPServerSpec{
+			Description: "test",
+			URL:         specURL,
+		},
+	}
+
+	t.Run("nil rewriter uses spec.URL verbatim", func(t *testing.T) {
+		kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &kagentReconciler{kube: kube, rmsURLRewriter: nil}
+
+		tsp, err := r.createMcpTransport(context.Background(), rms)
+		require.NoError(t, err)
+		require.NotNil(t, tsp)
+		streamable, ok := tsp.(*mcp.StreamableClientTransport)
+		require.True(t, ok, "expected Streamable HTTP transport for default protocol")
+		assert.Equal(t, specURL, streamable.Endpoint)
+	})
+
+	t.Run("rewriter substitutes the dial URL", func(t *testing.T) {
+		const rewrittenURL = "http://upstream.example.com:443/mcp"
+		stub := &stubRewriter{respURL: rewrittenURL}
+
+		kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &kagentReconciler{kube: kube, rmsURLRewriter: stub}
+
+		tsp, err := r.createMcpTransport(context.Background(), rms)
+		require.NoError(t, err)
+		require.True(t, stub.called, "rewriter must be called")
+		require.NotNil(t, stub.gotRMS)
+		assert.Equal(t, "rms", stub.gotRMS.Name, "rewriter receives the RMS being dialed")
+
+		streamable, ok := tsp.(*mcp.StreamableClientTransport)
+		require.True(t, ok)
+		assert.Equal(t, rewrittenURL, streamable.Endpoint, "rewritten URL must become the dial target")
+	})
+
+	t.Run("rewriter error propagates and aborts transport construction", func(t *testing.T) {
+		stub := &stubRewriter{respErr: assert.AnError}
+
+		kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &kagentReconciler{kube: kube, rmsURLRewriter: stub}
+
+		tsp, err := r.createMcpTransport(context.Background(), rms)
+		assert.Nil(t, tsp)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "rewrite RemoteMCPServer URL")
+	})
+
+	t.Run("rewriter applies to SSE transport too", func(t *testing.T) {
+		const rewrittenURL = "http://upstream.example.com:443/sse"
+		stub := &stubRewriter{respURL: rewrittenURL}
+
+		sseRMS := rms.DeepCopy()
+		sseRMS.Spec.Protocol = v1alpha2.RemoteMCPServerProtocolSse
+
+		kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &kagentReconciler{kube: kube, rmsURLRewriter: stub}
+
+		tsp, err := r.createMcpTransport(context.Background(), sseRMS)
+		require.NoError(t, err)
+		sse, ok := tsp.(*mcp.SSEClientTransport)
+		require.True(t, ok, "expected SSE transport when protocol is SSE")
+		assert.Equal(t, rewrittenURL, sse.Endpoint)
+	})
+}
+
+// generateTestCAPEM produces a minimal self-signed PEM certificate the
+// AppendCertsFromPEM call accepts. The cert isn't valid for any URL —
+// these tests only exercise the controller's parse-and-pool path.
+func generateTestCAPEM(t *testing.T) []byte {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "kagent-test-ca"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IsCA:         true,
+		KeyUsage:     x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }

@@ -252,7 +252,7 @@ func (a *adkApiTranslator) translateInlineAgent(ctx context.Context, agent v1alp
 
 		switch {
 		case tool.McpServer != nil:
-			err := a.translateMCPServerTarget(ctx, cfg, agent.GetNamespace(), tool.McpServer, headers, a.globalProxyURL)
+			err := a.translateMCPServerTarget(ctx, cfg, mdd, agent.GetNamespace(), tool.McpServer, headers, a.globalProxyURL)
 			if err != nil {
 				return nil, nil, nil, err
 			}

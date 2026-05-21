@@ -484,6 +484,7 @@ export interface RemoteMCPServerSpec {
   timeout?: string;
   sseReadTimeout?: string;
   terminateOnClose?: boolean;
+  tls?: TLSConfig;
 }
 
 export interface RemoteMCPServerResponse {

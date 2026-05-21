@@ -292,6 +292,11 @@ type ExtensionConfig struct {
 	AgentPlugins     []agent_translator.TranslatorPlugin
 	MCPServerPlugins []translator.MCPTranslatorPlugin
 	SandboxBackend   sandboxbackend.Backend
+
+	// RemoteMCPServerURLRewriter optionally transforms the URL the
+	// controller dials when discovering tools on a RemoteMCPServer.
+	// Nil means use the spec.URL verbatim.
+	RemoteMCPServerURLRewriter translator.RemoteMCPServerURLRewriter
 }
 
 type GetExtensionConfig func(bootstrap BootstrapConfig) (*ExtensionConfig, error)
@@ -527,6 +532,7 @@ func Start(getExtensionConfig GetExtensionConfig, migrationRunner MigrationRunne
 		cfg.DefaultModelConfig,
 		watchNamespacesList,
 		extensionCfg.SandboxBackend,
+		extensionCfg.RemoteMCPServerURLRewriter,
 	)
 
 	if err := (&controller.ServiceController{

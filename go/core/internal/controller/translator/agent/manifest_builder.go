@@ -28,10 +28,9 @@ type manifestContext struct {
 }
 
 type configSecretInputs struct {
-	secret     *corev1.Secret
-	configHash uint64
-	volumes    []corev1.Volume
-	mounts     []corev1.VolumeMount
+	secret  *corev1.Secret
+	volumes []corev1.Volume
+	mounts  []corev1.VolumeMount
 }
 
 type podRuntimeInputs struct {
@@ -57,7 +56,7 @@ func (a *adkApiTranslator) BuildManifest(
 	outputs := &AgentOutputs{}
 	manifestCtx := newManifestContext(agent, inputs.Deployment)
 
-	configSecret, err := a.buildConfigSecret(manifestCtx, inputs.Config, inputs.Sandbox, inputs.AgentCard, inputs.SecretHashBytes)
+	configSecret, err := a.buildConfigSecret(manifestCtx, inputs.Config, inputs.Sandbox, inputs.AgentCard)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +71,17 @@ func (a *adkApiTranslator) BuildManifest(
 		return nil, err
 	}
 
-	podTemplate := buildPodTemplate(manifestCtx, podRuntime, configSecret.configHash)
+	// Build the pod template with a placeholder config-hash. The real
+	// hash is computed and stamped after plugins run (see below): a
+	// plugin that mutates the config Secret needs the hash to reflect
+	// the mutation so pods roll on the next reconcile. buildPodTemplate
+	// initializes the Annotations map by reference; the post-plugin
+	// stamp writes into that same map, which workloadObjects share via
+	// Go's map-reference semantics — so the stamp propagates to
+	// whichever workload type buildWorkloadObjects produced (Deployment
+	// in normal mode, Sandbox in sandbox mode) without the translator
+	// needing to know about the workload's concrete type.
+	podTemplate := buildPodTemplate(manifestCtx, podRuntime, 0)
 
 	workloadObjects, err := a.buildWorkloadObjects(ctx, manifestCtx, podTemplate)
 	if err != nil {
@@ -89,7 +98,18 @@ func (a *adkApiTranslator) BuildManifest(
 		outputs.AgentCard = *inputs.AgentCard
 	}
 
-	return outputs, a.runPlugins(ctx, agent, outputs)
+	if err := a.runPlugins(ctx, agent, outputs); err != nil {
+		return outputs, err
+	}
+
+	// Stamp the post-plugin config-hash. The mutation propagates to
+	// every workload object that embedded podTemplate, since their
+	// pod-template Annotations map is the same reference as
+	// podTemplate.Annotations (see buildPodTemplate).
+	configHash := computeHashFromConfigSecret(configSecret.secret, inputs.SecretHashBytes)
+	podTemplate.Annotations["kagent.dev/config-hash"] = fmt.Sprintf("%d", configHash)
+
+	return outputs, nil
 }
 
 func newManifestContext(agent v1alpha2.AgentObject, dep *resolvedDeployment) manifestContext {
@@ -129,12 +149,10 @@ func (a *adkApiTranslator) buildConfigSecret(
 	cfg *adk.AgentConfig,
 	sandboxCfg *v1alpha2.SandboxConfig,
 	card *server.AgentCard,
-	modelConfigSecretHashBytes []byte,
 ) (*configSecretInputs, error) {
 	cfgJSON := ""
 	agentCard := ""
 	srtSettingsJSON := ""
-	var configHash uint64
 	var volumes []corev1.Volume
 	var mounts []corev1.VolumeMount
 
@@ -161,14 +179,6 @@ func (a *adkApiTranslator) buildConfigSecret(
 	}
 
 	if cfg != nil || srtSettingsJSON != "" {
-		secretData := modelConfigSecretHashBytes
-		if secretData == nil {
-			secretData = []byte{}
-		}
-		hashData := make([]byte, 0, len(secretData)+len(srtSettingsJSON))
-		hashData = append(hashData, secretData...)
-		hashData = append(hashData, srtSettingsJSON...)
-		configHash = computeConfigHash([]byte(cfgJSON), []byte(agentCard), hashData)
 		volumes = []corev1.Volume{{
 			Name: "config",
 			VolumeSource: corev1.VolumeSource{
@@ -184,10 +194,47 @@ func (a *adkApiTranslator) buildConfigSecret(
 			ObjectMeta: manifestCtx.objectMeta(),
 			StringData: buildConfigSecretData(cfgJSON, agentCard, srtSettingsJSON),
 		},
-		configHash: configHash,
-		volumes:    volumes,
-		mounts:     mounts,
+		volumes: volumes,
+		mounts:  mounts,
 	}, nil
+}
+
+// computeHashFromConfigSecret derives the kagent.dev/config-hash
+// annotation value from the agent's config Secret. Called after plugins
+// have had a chance to mutate the Secret's contents — so the hash
+// reflects what the agent pod will actually load at startup, and
+// plugin-driven mutations naturally trigger rollouts on the next
+// reconcile.
+//
+// modelConfigSecretHashBytes is the controller-resolved hash over
+// upstream credentials (API key, etc.) that aren't stored in the Secret
+// itself but still need to participate in the rollout signal. It's not
+// touched by plugins; passing it through preserves the pre/post-plugin
+// hash equivalence in the no-mutation case so existing agents don't
+// roll on this change alone.
+//
+// Returns 0 in the no-config case (matches the original gate in
+// buildConfigSecret) so pods that have no config to roll on stay
+// stable.
+func computeHashFromConfigSecret(secret *corev1.Secret, modelConfigSecretHashBytes []byte) uint64 {
+	if secret == nil {
+		return 0
+	}
+	cfgJSON := secret.StringData["config.json"]
+	agentCard := secret.StringData["agent-card.json"]
+	srtSettings := secret.StringData["srt-settings.json"]
+	if cfgJSON == "" && srtSettings == "" {
+		return 0
+	}
+
+	secretData := modelConfigSecretHashBytes
+	if secretData == nil {
+		secretData = []byte{}
+	}
+	hashData := make([]byte, 0, len(secretData)+len(srtSettings))
+	hashData = append(hashData, secretData...)
+	hashData = append(hashData, srtSettings...)
+	return computeConfigHash([]byte(cfgJSON), []byte(agentCard), hashData)
 }
 
 func buildConfigSecretData(cfgJSON, agentCard, srtSettingsJSON string) map[string]string {

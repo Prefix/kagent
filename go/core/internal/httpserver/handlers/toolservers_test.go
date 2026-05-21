@@ -377,6 +377,193 @@ func TestToolServersHandler(t *testing.T) {
 			require.NotNil(t, responseRecorder.errorReceived)
 		})
 
+		// SecretMaterials companion-Secret support mirrors the ModelConfig
+		// inline-Secret pattern so operators can create an RMS/MCPServer
+		// and its referenced Secrets in a single POST without
+		// pre-creating Secret objects out of band.
+		t.Run("Success_RemoteMCPServer_WithSecretMaterials_CreatesCASecret", func(t *testing.T) {
+			handler, kubeClient, _, responseRecorder := setupHandler(t)
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "RemoteMCPServer",
+				RemoteMCPServer: &v1alpha2.RemoteMCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "corp-mcp", Namespace: "default"},
+					Spec: v1alpha2.RemoteMCPServerSpec{
+						Description: "Corp-CA MCP",
+						URL:         "https://mcp.corp.internal/mcp",
+						TLS: &v1alpha2.TLSConfig{
+							CACertSecretRef: "corp-ca",
+							CACertSecretKey: "ca.crt",
+						},
+					},
+				},
+				Secrets: []api.SecretMaterial{
+					{Name: "corp-ca", Key: "ca.crt", Value: "FAKE PEM"},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "test-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+			require.Equal(t, http.StatusCreated, responseRecorder.Code)
+
+			// Companion Secret created in the same namespace.
+			secret := &corev1.Secret{}
+			err := kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "corp-ca"}, secret)
+			require.NoError(t, err)
+			assert.Equal(t, corev1.SecretTypeOpaque, secret.Type)
+			assert.Equal(t, []byte("FAKE PEM"), secret.Data["ca.crt"])
+
+			// OwnerReference points back at the RMS so K8s GC cleans it up.
+			require.Len(t, secret.OwnerReferences, 1)
+			or := secret.OwnerReferences[0]
+			assert.Equal(t, "RemoteMCPServer", or.Kind)
+			assert.Equal(t, "corp-mcp", or.Name)
+			assert.Equal(t, v1alpha2.GroupVersion.Identifier(), or.APIVersion)
+		})
+
+		t.Run("Success_MCPServer_WithSecretMaterials_CreatesEnvSecret", func(t *testing.T) {
+			handler, kubeClient, _, responseRecorder := setupHandler(t)
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "MCPServer",
+				MCPServer: &v1alpha1.MCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "kmcp-with-creds", Namespace: "default"},
+					Spec: v1alpha1.MCPServerSpec{
+						Deployment: v1alpha1.MCPServerDeployment{
+							Image: "example/kmcp:latest",
+							Port:  8080,
+							Cmd:   "/bin/serve",
+							SecretRefs: []corev1.LocalObjectReference{
+								{Name: "kmcp-creds"},
+							},
+						},
+					},
+				},
+				Secrets: []api.SecretMaterial{
+					{Name: "kmcp-creds", Key: "API_TOKEN", Value: "shhh"},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "test-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+			require.Equal(t, http.StatusCreated, responseRecorder.Code)
+
+			secret := &corev1.Secret{}
+			err := kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "kmcp-creds"}, secret)
+			require.NoError(t, err)
+			assert.Equal(t, []byte("shhh"), secret.Data["API_TOKEN"])
+			require.Len(t, secret.OwnerReferences, 1)
+			or := secret.OwnerReferences[0]
+			assert.Equal(t, "MCPServer", or.Kind)
+			assert.Equal(t, "kmcp-with-creds", or.Name)
+		})
+
+		t.Run("SecretMaterial_GroupsMultipleKeysIntoSingleSecret", func(t *testing.T) {
+			handler, kubeClient, _, responseRecorder := setupHandler(t)
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "RemoteMCPServer",
+				RemoteMCPServer: &v1alpha2.RemoteMCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "multi-secret-mcp", Namespace: "default"},
+					Spec: v1alpha2.RemoteMCPServerSpec{
+						Description: "RMS with multi-key Secret",
+						URL:         "https://mcp.corp.internal/mcp",
+					},
+				},
+				Secrets: []api.SecretMaterial{
+					{Name: "shared", Key: "ca.crt", Value: "PEM"},
+					{Name: "shared", Key: "token", Value: "abc"},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "test-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+			require.Equal(t, http.StatusCreated, responseRecorder.Code)
+
+			secret := &corev1.Secret{}
+			err := kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "shared"}, secret)
+			require.NoError(t, err)
+			assert.Equal(t, []byte("PEM"), secret.Data["ca.crt"])
+			assert.Equal(t, []byte("abc"), secret.Data["token"])
+		})
+
+		t.Run("SecretMaterial_InvalidName_Rejected", func(t *testing.T) {
+			handler, _, _, responseRecorder := setupHandler(t)
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "RemoteMCPServer",
+				RemoteMCPServer: &v1alpha2.RemoteMCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "rms-invalid-secret", Namespace: "default"},
+					Spec: v1alpha2.RemoteMCPServerSpec{
+						Description: "x", URL: "https://x/y",
+					},
+				},
+				Secrets: []api.SecretMaterial{
+					{Name: "INVALID NAME WITH SPACES", Key: "ca.crt", Value: "x"},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "test-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+			assert.Equal(t, http.StatusBadRequest, responseRecorder.Code)
+		})
+
+		t.Run("SecretMaterial_ExistingSecretNotOwned_Rejected", func(t *testing.T) {
+			handler, kubeClient, _, responseRecorder := setupHandler(t)
+
+			// Pre-create a Secret that isn't owned by any RMS.
+			preexisting := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "stranger", Namespace: "default"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"ca.crt": []byte("OLD")},
+			}
+			require.NoError(t, kubeClient.Create(context.Background(), preexisting))
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "RemoteMCPServer",
+				RemoteMCPServer: &v1alpha2.RemoteMCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "stranger-rms", Namespace: "default"},
+					Spec: v1alpha2.RemoteMCPServerSpec{
+						Description: "x", URL: "https://x/y",
+					},
+				},
+				Secrets: []api.SecretMaterial{
+					{Name: "stranger", Key: "ca.crt", Value: "NEW"},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "test-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+			// The 400 surfaces from companionSecretAPIError when the
+			// existing Secret isn't already owned by this RMS.
+			assert.Equal(t, http.StatusBadRequest, responseRecorder.Code)
+
+			// Confirm the unrelated Secret wasn't mutated.
+			fresh := &corev1.Secret{}
+			err := kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "stranger"}, fresh)
+			require.NoError(t, err)
+			assert.Equal(t, []byte("OLD"), fresh.Data["ca.crt"])
+		})
+
 		t.Run("ToolServerAlreadyExists", func(t *testing.T) {
 			handler, kubeClient, _, responseRecorder := setupHandler(t)
 

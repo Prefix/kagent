@@ -217,56 +217,100 @@ func (r *adkApiTranslator) GetOwnedResourceTypes() []client.Object {
 
 const (
 	googleCredsVolumeName = "google-creds"
-	tlsCACertVolumeName   = "tls-ca-cert"
-	tlsCACertMountPath    = "/etc/ssl/certs/custom"
+	tlsCAVolumePrefix     = "tls-ca-"
+	tlsCAMountRoot        = "/etc/ssl/certs/custom"
+	maxDNS1123LabelLen    = 63
 	gdchCredsVolumeName   = "gdch-creds"
 	gdchCredsMountPath    = "/gdch-creds"
 )
 
-// populateTLSFields populates TLS configuration fields in the BaseModel
-// from the ModelConfig TLS spec.
-func populateTLSFields(baseModel *adk.BaseModel, tlsConfig *v1alpha2.TLSConfig) {
-	if tlsConfig == nil {
-		return
-	}
+// dns1123LabelRE matches RFC 1123 labels (lowercase alphanumeric + dashes,
+// must start and end with alphanumeric). K8s volume names require this
+// grammar — but K8s Secret names follow the looser DNS_SUBDOMAIN grammar
+// (dots allowed, up to 253 chars), so a literal Secret name like
+// `corp.ca` or cert-manager-style `mcp.example.com-tls` would fail volume
+// name validation if embedded verbatim. tlsCAPaths hashes the name when
+// it would violate this regex (or the length limit) for that reason.
+var dns1123LabelRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
-	// Set TLS configuration fields in BaseModel
-	baseModel.TLSInsecureSkipVerify = &tlsConfig.DisableVerify
-	baseModel.TLSDisableSystemCAs = &tlsConfig.DisableSystemCAs
-
-	// Set CA cert path if Secret and key are both specified
-	if tlsConfig.CACertSecretRef != "" && tlsConfig.CACertSecretKey != "" {
-		certPath := fmt.Sprintf("%s/%s", tlsCACertMountPath, tlsConfig.CACertSecretKey)
-		baseModel.TLSCACertPath = &certPath
+// tlsCAPaths returns deterministic volume name, mount path, and cert file
+// path for the given Secret reference. Per-Secret naming lets multiple TLS
+// sources (chat ModelConfig + embedding ModelConfig + RemoteMCPServers) on
+// the same agent pod coexist without colliding when their
+// modelDeploymentData entries get merged (mergeDeploymentData dedupes by
+// (Name, MountPath) for VolumeMounts and by Name for Volumes).
+func tlsCAPaths(secretName, key string) (volumeName, mountPath, certPath string) {
+	candidate := tlsCAVolumePrefix + secretName
+	id := secretName
+	if len(candidate) > maxDNS1123LabelLen || !dns1123LabelRE.MatchString(candidate) {
+		h := sha256.Sum256([]byte(secretName))
+		id = hex.EncodeToString(h[:])[:8]
 	}
+	volumeName = tlsCAVolumePrefix + id
+	mountPath = path.Join(tlsCAMountRoot, id)
+	certPath = path.Join(mountPath, key)
+	return
 }
 
-// addTLSConfiguration adds TLS certificate volume mounts to modelDeploymentData
-// when TLS configuration is present in the ModelConfig.
-// Note: TLS configuration fields are now included in agent config JSON via BaseModel,
-// so this function only handles volume mounting.
+// deriveTLSFields turns a v1alpha2.TLSConfig into the three pointer fields
+// that every TLS-aware adk wire type carries (BaseModel,
+// StreamableHTTPConnectionParams, SseConnectionParams). Returns nils for
+// nil or all-zero configs so the caller can assign-through to all three
+// fields in a single statement. Emitting explicit `false` booleans on
+// an empty struct would flip the Python runtime out of its no-op
+// short-circuit and silently swap google-adk's default httpx client for
+// kagent's, which has the same SSL behavior but different
+// timeout/redirect defaults.
+func deriveTLSFields(tlsConfig *v1alpha2.TLSConfig) (insecureSkipVerify *bool, caCertPath *string, disableSystemCAs *bool) {
+	if tlsConfig.IsEmpty() {
+		return nil, nil, nil
+	}
+	insecureSkipVerify = &tlsConfig.DisableVerify
+	disableSystemCAs = &tlsConfig.DisableSystemCAs
+	if tlsConfig.CACertSecretRef != "" && tlsConfig.CACertSecretKey != "" {
+		_, _, p := tlsCAPaths(tlsConfig.CACertSecretRef, tlsConfig.CACertSecretKey)
+		caCertPath = &p
+	}
+	return
+}
+
+// addTLSConfiguration mounts a CA Secret as a per-Secret read-only volume on
+// modelDeploymentData. Safe to call multiple times for the same agent with
+// the same OR different TLSConfigs:
+//   - different Secrets produce different volume names + paths and accumulate.
+//   - the same Secret referenced from multiple sources (e.g. several RMSs
+//     pointing at one shared corp-CA bundle) is idempotent — we skip the
+//     append if a volume with the same name is already present, because the
+//     RemoteMCPServer path (translateRemoteMCPServerTarget) appends directly to the
+//     already-merged modelDeploymentData rather than through
+//     mergeDeploymentData.
 func addTLSConfiguration(modelDeploymentData *modelDeploymentData, tlsConfig *v1alpha2.TLSConfig) {
 	if tlsConfig == nil {
 		return
 	}
 
-	// Add Secret volume mount if both CA certificate Secret and key are specified
 	if tlsConfig.CACertSecretRef != "" && tlsConfig.CACertSecretKey != "" {
-		// Add volume from Secret
+		volumeName, mountPath, _ := tlsCAPaths(tlsConfig.CACertSecretRef, tlsConfig.CACertSecretKey)
+
+		for _, v := range modelDeploymentData.Volumes {
+			if v.Name == volumeName {
+				return
+			}
+		}
+
 		modelDeploymentData.Volumes = append(modelDeploymentData.Volumes, corev1.Volume{
-			Name: tlsCACertVolumeName,
+			Name: volumeName,
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName:  tlsConfig.CACertSecretRef,
-					DefaultMode: new(int32(0444)), // Read-only for all users
+					DefaultMode: new(int32(0444)),
 				},
 			},
 		})
 
-		// Add volume mount
 		modelDeploymentData.VolumeMounts = append(modelDeploymentData.VolumeMounts, corev1.VolumeMount{
-			Name:      tlsCACertVolumeName,
-			MountPath: tlsCACertMountPath,
+			Name:      volumeName,
+			MountPath: mountPath,
 			ReadOnly:  true,
 		})
 	}
@@ -371,7 +415,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&openai.BaseModel, model.Spec.TLS)
+		openai.BaseModel.TLSInsecureSkipVerify, openai.BaseModel.TLSCACertPath, openai.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		// Populate TokenExchange fields (OpenAI-specific)
 		addTokenExchangeConfiguration(openai, modelDeploymentData, &model.Spec)
 		openai.APIKeyPassthrough = model.Spec.APIKeyPassthrough
@@ -429,7 +473,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&anthropic.BaseModel, model.Spec.TLS)
+		anthropic.BaseModel.TLSInsecureSkipVerify, anthropic.BaseModel.TLSCACertPath, anthropic.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		anthropic.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		if model.Spec.Anthropic != nil {
@@ -478,7 +522,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&azureOpenAI.BaseModel, model.Spec.TLS)
+		azureOpenAI.BaseModel.TLSInsecureSkipVerify, azureOpenAI.BaseModel.TLSCACertPath, azureOpenAI.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		azureOpenAI.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return azureOpenAI, modelDeploymentData, secretHashBytes, nil
@@ -523,7 +567,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&gemini.BaseModel, model.Spec.TLS)
+		gemini.BaseModel.TLSInsecureSkipVerify, gemini.BaseModel.TLSCACertPath, gemini.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		gemini.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return gemini, modelDeploymentData, secretHashBytes, nil
@@ -564,7 +608,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&anthropic.BaseModel, model.Spec.TLS)
+		anthropic.BaseModel.TLSInsecureSkipVerify, anthropic.BaseModel.TLSCACertPath, anthropic.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		anthropic.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return anthropic, modelDeploymentData, secretHashBytes, nil
@@ -588,7 +632,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			Options: model.Spec.Ollama.Options,
 		}
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&ollama.BaseModel, model.Spec.TLS)
+		ollama.BaseModel.TLSInsecureSkipVerify, ollama.BaseModel.TLSCACertPath, ollama.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		ollama.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return ollama, modelDeploymentData, secretHashBytes, nil
@@ -611,8 +655,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&gemini.BaseModel, model.Spec.TLS)
-
+		gemini.BaseModel.TLSInsecureSkipVerify, gemini.BaseModel.TLSCACertPath, gemini.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		return gemini, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderBedrock:
 		if model.Spec.Bedrock == nil {
@@ -700,7 +743,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 		}
 
 		// Populate TLS fields in BaseModel
-		populateTLSFields(&bedrock.BaseModel, model.Spec.TLS)
+		bedrock.BaseModel.TLSInsecureSkipVerify, bedrock.BaseModel.TLSCACertPath, bedrock.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		bedrock.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return bedrock, modelDeploymentData, secretHashBytes, nil
@@ -749,7 +792,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			AuthUrl:       model.Spec.SAPAICore.AuthURL,
 		}
 
-		populateTLSFields(&sapAICore.BaseModel, model.Spec.TLS)
+		sapAICore.BaseModel.TLSInsecureSkipVerify, sapAICore.BaseModel.TLSCACertPath, sapAICore.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		sapAICore.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return sapAICore, modelDeploymentData, secretHashBytes, nil
@@ -788,6 +831,7 @@ func (a *adkApiTranslator) translateStreamableHttpTool(ctx context.Context, serv
 	if server.Spec.TerminateOnClose != nil {
 		params.TerminateOnClose = server.Spec.TerminateOnClose
 	}
+	params.TLSInsecureSkipVerify, params.TLSCACertPath, params.TLSDisableSystemCAs = deriveTLSFields(server.Spec.TLS)
 
 	return params, nil
 }
@@ -819,10 +863,11 @@ func (a *adkApiTranslator) translateSseHttpTool(ctx context.Context, server *v1a
 	if server.Spec.SseReadTimeout != nil {
 		params.SseReadTimeout = new(server.Spec.SseReadTimeout.Seconds())
 	}
+	params.TLSInsecureSkipVerify, params.TLSCACertPath, params.TLSDisableSystemCAs = deriveTLSFields(server.Spec.TLS)
 	return params, nil
 }
 
-func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, agentNamespace string, toolServer *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
+func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, mdd *modelDeploymentData, agentNamespace string, toolServer *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
 	gvk := toolServer.GroupKind()
 
 	switch gvk {
@@ -853,7 +898,7 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 			return err
 		}
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentHeaders, proxyURL)
+		return a.translateRemoteMCPServerTarget(ctx, agent, mdd, remoteMcpServer, toolServer, agentHeaders, proxyURL)
 
 	case schema.GroupKind{
 		Group: "",
@@ -879,7 +924,7 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 			proxyURL = a.globalProxyURL
 		}
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentHeaders, proxyURL)
+		return a.translateRemoteMCPServerTarget(ctx, agent, mdd, remoteMcpServer, toolServer, agentHeaders, proxyURL)
 	case schema.GroupKind{
 		Group: "",
 		Kind:  "Service",
@@ -902,13 +947,13 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 			return err
 		}
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentHeaders, proxyURL)
+		return a.translateRemoteMCPServerTarget(ctx, agent, mdd, remoteMcpServer, toolServer, agentHeaders, proxyURL)
 	default:
 		return fmt.Errorf("unknown tool server type: %s", gvk)
 	}
 }
 
-func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, remoteMcpServer *v1alpha2.RemoteMCPServer, mcpServerTool *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
+func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, mdd *modelDeploymentData, remoteMcpServer *v1alpha2.RemoteMCPServer, mcpServerTool *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
 	switch remoteMcpServer.Spec.Protocol {
 	case v1alpha2.RemoteMCPServerProtocolSse:
 		tool, err := a.translateSseHttpTool(ctx, remoteMcpServer, agentHeaders, proxyURL)
@@ -932,6 +977,12 @@ func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, a
 			AllowedHeaders:  mcpServerTool.AllowedHeaders,
 			RequireApproval: mcpServerTool.RequireApproval,
 		})
+	}
+	// Mount the CA Secret on the agent pod when the RemoteMCPServer pins a TLS bundle.
+	// Converters that synthesize RMSs from in-cluster MCPServer/Service
+	// references don't set Spec.TLS, so this is a no-op for those.
+	if mdd != nil {
+		addTLSConfiguration(mdd, remoteMcpServer.Spec.TLS)
 	}
 	return nil
 }
@@ -1042,9 +1093,13 @@ func mergeDeploymentData(dst, src *modelDeploymentData) {
 		}
 	}
 	for _, sm := range src.VolumeMounts {
+		// Dedupe by (Name, MountPath). MountPath-only dedupe would silently
+		// drop a mount from a different Volume that happened to choose the
+		// same path; matching on both lets kubelet surface the conflict
+		// loudly instead.
 		found := false
 		for _, m := range dst.VolumeMounts {
-			if m.MountPath == sm.MountPath {
+			if m.Name == sm.Name && m.MountPath == sm.MountPath {
 				found = true
 				break
 			}

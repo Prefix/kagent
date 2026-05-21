@@ -39,7 +39,28 @@ type ToolServerCreateRequest struct {
 
 	// MCPServer is used when Type is "MCPServer"
 	MCPServer *v1alpha1.MCPServer `json:"mcpServer,omitempty"`
+
+	// Secrets are optional companion Secrets to create or update
+	// alongside the ToolServer. Each entry materializes as a key in a
+	// Kubernetes Secret of type Opaque, owned by the created
+	// ToolServer so K8s GC cleans them up on delete. Names referenced
+	// here (e.g. RemoteMCPServer.spec.tls.caCertSecretRef,
+	// RemoteMCPServer.spec.headersFrom[].valueFrom.secretRef.name,
+	// MCPServer.spec.secretRefs[].name) must match a Secret described
+	// in this list when the operator wants the API to materialize the
+	// content inline. Pre-existing Secrets can also be referenced
+	// directly without supplying material here.
+	Secrets []api.SecretMaterial `json:"secrets,omitempty"`
 }
+
+// remoteMCPServerGVK and mcpServerGVK are passed to the
+// companion-secret helpers so the OwnerReference and ownership check
+// use the right Kind. kmcp.MCPServer shares the kagent.dev group with
+// v1alpha2 (see kmcp/api/v1alpha1/groupversion_info.go).
+var (
+	remoteMCPServerGVK = v1alpha2.GroupVersion.WithKind("RemoteMCPServer")
+	mcpServerGVK       = v1alpha1.GroupVersion.WithKind("MCPServer")
+)
 
 // HandleListToolServers handles GET /api/toolservers requests
 func (h *ToolServersHandler) HandleListToolServers(w ErrorResponseWriter, r *http.Request) {
@@ -107,26 +128,31 @@ func (h *ToolServersHandler) HandleCreateToolServer(w ErrorResponseWriter, r *ht
 		return
 	}
 
+	if err := validateSecretMaterials(toolServerRequest.Secrets); err != nil {
+		w.RespondWithError(errors.NewBadRequestError(err.Error(), err))
+		return
+	}
+
 	switch toolServerRequest.Type {
 	case ToolServerTypeRemoteMCPServer:
 		if toolServerRequest.RemoteMCPServer == nil {
 			w.RespondWithError(errors.NewBadRequestError("RemoteMCPServer data is required when type is RemoteMCPServer", nil))
 			return
 		}
-		h.handleCreateRemoteMCPServer(w, r, toolServerRequest.RemoteMCPServer, log)
+		h.handleCreateRemoteMCPServer(w, r, toolServerRequest.RemoteMCPServer, toolServerRequest.Secrets, log)
 	case ToolServerTypeMCPServer:
 		if toolServerRequest.MCPServer == nil {
 			w.RespondWithError(errors.NewBadRequestError("MCPServer data is required when type is MCPServer", nil))
 			return
 		}
-		h.handleCreateMCPServer(w, r, toolServerRequest.MCPServer, log)
+		h.handleCreateMCPServer(w, r, toolServerRequest.MCPServer, toolServerRequest.Secrets, log)
 	default:
 		w.RespondWithError(errors.NewBadRequestError(fmt.Sprintf("Invalid tool server type. Must be one of %s", toolServerTypes.Join(", ")), nil))
 	}
 }
 
 // handleCreateRemoteMCPServer handles the creation of a RemoteMCPServer
-func (h *ToolServersHandler) handleCreateRemoteMCPServer(w ErrorResponseWriter, r *http.Request, toolServerRequest *v1alpha2.RemoteMCPServer, log logr.Logger) {
+func (h *ToolServersHandler) handleCreateRemoteMCPServer(w ErrorResponseWriter, r *http.Request, toolServerRequest *v1alpha2.RemoteMCPServer, secrets []api.SecretMaterial, log logr.Logger) {
 	if toolServerRequest.Namespace == "" {
 		toolServerRequest.Namespace = common.GetResourceNamespace()
 	}
@@ -150,13 +176,19 @@ func (h *ToolServersHandler) handleCreateRemoteMCPServer(w ErrorResponseWriter, 
 		return
 	}
 
+	if err := createOrUpdateCompanionSecrets(r.Context(), h.KubeClient, toolServerRequest, remoteMCPServerGVK, secrets); err != nil {
+		log.Error(err, "Failed to create or update companion secrets")
+		w.RespondWithError(companionSecretAPIError(err))
+		return
+	}
+
 	log.Info("Successfully created RemoteMCPServer")
 	data := api.NewResponse(toolServerRequest, "Successfully created RemoteMCPServer", false)
 	RespondWithJSON(w, http.StatusCreated, data)
 }
 
 // handleCreateMCPServer handles the creation of an MCPServer (stdio-based)
-func (h *ToolServersHandler) handleCreateMCPServer(w ErrorResponseWriter, r *http.Request, toolServerRequest *v1alpha1.MCPServer, log logr.Logger) {
+func (h *ToolServersHandler) handleCreateMCPServer(w ErrorResponseWriter, r *http.Request, toolServerRequest *v1alpha1.MCPServer, secrets []api.SecretMaterial, log logr.Logger) {
 	if toolServerRequest.Namespace == "" {
 		toolServerRequest.Namespace = common.GetResourceNamespace()
 	}
@@ -181,6 +213,12 @@ func (h *ToolServersHandler) handleCreateMCPServer(w ErrorResponseWriter, r *htt
 
 	if err := h.KubeClient.Create(r.Context(), toolServerRequest); err != nil {
 		w.RespondWithError(errors.NewInternalServerError("Failed to create MCPServer in Kubernetes", err))
+		return
+	}
+
+	if err := createOrUpdateCompanionSecrets(r.Context(), h.KubeClient, toolServerRequest, mcpServerGVK, secrets); err != nil {
+		log.Error(err, "Failed to create or update companion secrets")
+		w.RespondWithError(companionSecretAPIError(err))
 		return
 	}
 
