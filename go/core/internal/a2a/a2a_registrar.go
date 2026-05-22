@@ -8,10 +8,11 @@ import (
 	"reflect"
 	"time"
 
+	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
+	a2aclient "github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/go-logr/logr"
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	agent_translator "github.com/kagent-dev/kagent/go/core/internal/controller/translator/agent"
-	authimpl "github.com/kagent-dev/kagent/go/core/internal/httpserver/auth"
 	common "github.com/kagent-dev/kagent/go/core/internal/utils"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"github.com/kagent-dev/kagent/go/core/pkg/env"
@@ -20,16 +21,14 @@ import (
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	a2aclient "trpc.group/trpc-go/trpc-a2a-go/client"
 )
 
 type A2ARegistrar struct {
-	cache          crcache.Cache
-	handlerMux     A2AHandlerMux
-	a2aBaseURL     string
-	sandboxA2AURL  string
-	authenticator  auth.AuthProvider
-	a2aBaseOptions []a2aclient.Option
+	cache         crcache.Cache
+	handlerMux    A2AHandlerMux
+	a2aBaseURL    string
+	sandboxA2AURL string
+	authenticator auth.AuthProvider
 }
 
 var _ manager.Runnable = (*A2ARegistrar)(nil)
@@ -40,9 +39,9 @@ func NewA2ARegistrar(
 	a2aBaseUrl string,
 	sandboxA2ABaseURL string,
 	authenticator auth.AuthProvider,
-	streamingMaxBuf int,
-	streamingInitialBuf int,
-	streamingTimeout time.Duration,
+	_ int,
+	_ int,
+	_ time.Duration,
 ) *A2ARegistrar {
 	reg := &A2ARegistrar{
 		cache:         cache,
@@ -50,11 +49,6 @@ func NewA2ARegistrar(
 		a2aBaseURL:    a2aBaseUrl,
 		sandboxA2AURL: sandboxA2ABaseURL,
 		authenticator: authenticator,
-		a2aBaseOptions: []a2aclient.Option{
-			a2aclient.WithTimeout(streamingTimeout),
-			a2aclient.WithBuffer(streamingInitialBuf, streamingMaxBuf),
-			debugOpt(),
-		},
 	}
 
 	return reg
@@ -161,26 +155,22 @@ func (a *A2ARegistrar) upsertAgentHandler(ctx context.Context, agent v1alpha2.Ag
 
 	provider := resolveProviderName(ctx, a.cache, agent)
 
-	client, err := a2aclient.NewA2AClient(
-		card.URL,
-		append(
-			a.a2aBaseOptions,
-			a2aclient.WithHTTPReqHandler(
-				&traceInjectHandler{
-					next: authimpl.A2ARequestHandler(
-						a.authenticator,
-						agentRef,
-					),
-				},
-			),
-		)...,
+	httpClient := debugHTTPClient()
+	client, err := a2aclient.NewFromEndpoints(
+		ctx,
+		// TODO: Switch this to 1.0 in release 0.11.0 when all agents are migrated to v1
+		filterInterfacesByVersion(card.SupportedInterfaces, a2atype.ProtocolVersion("0.3")),
+		a2aclient.WithJSONRPCTransport(httpClient),
+		a2aclient.WithCallInterceptors(
+			NewUpstreamAuthInterceptor(a.authenticator, agentRef),
+		),
 	)
 	if err != nil {
 		return fmt.Errorf("create A2A client for %s: %w", agentRef, err)
 	}
 
 	cardCopy := *card
-	cardCopy.URL = a.a2aRouteURL(agent)
+	cardCopy.SupportedInterfaces = cloneInterfacesWithURL(card.SupportedInterfaces, a.a2aRouteURL(agent))
 
 	if err := a.handlerMux.SetAgentHandler(a2aRouteKey(agent), client, cardCopy, newA2ATracingMiddleware(agentRef, provider)); err != nil {
 		return fmt.Errorf("set handler for %s: %w", agentRef, err)
@@ -190,7 +180,7 @@ func (a *A2ARegistrar) upsertAgentHandler(ctx context.Context, agent v1alpha2.Ag
 	return nil
 }
 
-func debugOpt() a2aclient.Option {
+func debugHTTPClient() *http.Client {
 	debugAddr := env.KagentA2ADebugAddr.Get()
 	if debugAddr != "" {
 		client := new(http.Client)
@@ -200,10 +190,9 @@ func debugOpt() a2aclient.Option {
 				return zeroDialer.DialContext(ctx, network, debugAddr)
 			},
 		}
-		return a2aclient.WithHTTPClient(client)
-	} else {
-		return func(*a2aclient.A2AClient) {}
+		return client
 	}
+	return &http.Client{}
 }
 
 func (a *A2ARegistrar) a2aRouteURL(agent v1alpha2.AgentObject) string {
@@ -221,4 +210,45 @@ func a2aRouteKey(agent v1alpha2.AgentObject) string {
 func a2aRoutePath(agent v1alpha2.AgentObject) string {
 	agentRef := types.NamespacedName{Namespace: agent.GetNamespace(), Name: agent.GetName()}
 	return routeKey(agent.GetWorkloadMode() == v1alpha2.WorkloadModeSandbox, agentRef.Namespace, agentRef.Name)
+}
+
+func cloneInterfacesWithURL(interfaces []*a2atype.AgentInterface, url string) []*a2atype.AgentInterface {
+	if len(interfaces) == 0 {
+		return []*a2atype.AgentInterface{
+			{
+				URL:             url,
+				ProtocolBinding: a2atype.TransportProtocolJSONRPC,
+				ProtocolVersion: a2atype.Version,
+			},
+		}
+	}
+	result := make([]*a2atype.AgentInterface, 0, len(interfaces))
+	for _, i := range interfaces {
+		if i == nil {
+			continue
+		}
+		copied := *i
+		copied.URL = url
+		if copied.ProtocolVersion == "" {
+			copied.ProtocolVersion = a2atype.Version
+		}
+		result = append(result, &copied)
+	}
+	return result
+}
+
+func filterInterfacesByVersion(interfaces []*a2atype.AgentInterface, version a2atype.ProtocolVersion) []*a2atype.AgentInterface {
+	filtered := make([]*a2atype.AgentInterface, 0, len(interfaces))
+	for _, i := range interfaces {
+		if i == nil {
+			continue
+		}
+		if i.ProtocolVersion == version {
+			filtered = append(filtered, i)
+		}
+	}
+	if len(filtered) > 0 {
+		return filtered
+	}
+	return interfaces
 }

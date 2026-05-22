@@ -2,25 +2,24 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/jsonschema-go/jsonschema"
+	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
+	a2aclientv2 "github.com/a2aproject/a2a-go/v2/a2aclient"
+	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	"github.com/kagent-dev/kagent/go/core/internal/a2a"
-	authimpl "github.com/kagent-dev/kagent/go/core/internal/httpserver/auth"
 	"github.com/kagent-dev/kagent/go/core/internal/version"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
-	"github.com/kagent-dev/kagent/go/core/pkg/env"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
-	a2aclient "trpc.group/trpc-go/trpc-a2a-go/client"
-	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 )
 
 // MCPHandler handles MCP requests and bridges them to A2A endpoints
@@ -83,21 +82,12 @@ func NewMCPHandler(kubeClient client.Client, a2aBaseURL string, authenticator au
 	server := mcpsdk.NewServer(impl, nil)
 	handler.server = server
 
-	// Add list_agents tool.
-	// InputSchema is set explicitly (rather than reflected from the empty
-	// ListAgentsInput struct) so the serialized schema includes "properties": {}.
-	// OpenAI strict mode rejects object schemas without a properties key.
-	// See https://github.com/kagent-dev/kagent/issues/1889.
+	// Add list_agents tool
 	mcpsdk.AddTool[ListAgentsInput, ListAgentsOutput](
 		server,
 		&mcpsdk.Tool{
 			Name:        "list_agents",
 			Description: "List invokable kagent agents (accepted + deploymentReady)",
-			InputSchema: &jsonschema.Schema{
-				Type:                 "object",
-				Properties:           map[string]*jsonschema.Schema{},
-				AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
-			},
 		},
 		handler.handleListAgents,
 	)
@@ -113,15 +103,11 @@ func NewMCPHandler(kubeClient client.Client, a2aBaseURL string, authenticator au
 	)
 
 	// Create HTTP handler
-	var httpOpts *mcpsdk.StreamableHTTPOptions
-	if env.KagentMCPStateless.Get() {
-		httpOpts = &mcpsdk.StreamableHTTPOptions{Stateless: true}
-	}
 	handler.httpHandler = mcpsdk.NewStreamableHTTPHandler(
 		func(*http.Request) *mcpsdk.Server {
 			return server
 		},
-		httpOpts,
+		nil,
 	)
 
 	return handler, nil
@@ -211,38 +197,39 @@ func (h *MCPHandler) handleInvokeAgent(ctx context.Context, req *mcpsdk.CallTool
 	agentRef := agentNS + "/" + agentName
 	agentNns := types.NamespacedName{Namespace: agentNS, Name: agentName}
 
-	// Get context ID from client request (stateless mode)
-	// If not provided, contextIDPtr will be nil and a new conversation will start
-	var contextIDPtr *string
-	if input.ContextID != "" {
-		contextIDPtr = &input.ContextID
-		log.V(1).Info("Using context_id from client request", "context_id", input.ContextID)
-	}
-
 	// Get or create cached A2A client for this agent
 	a2aURL := fmt.Sprintf("%s/%s/", h.a2aBaseURL, agentRef)
-	var a2aClient *a2aclient.A2AClient
+	var a2aClient *a2aclientv2.Client
 
 	if cached, ok := h.a2aClients.Load(agentRef); ok {
-		if client, ok := cached.(*a2aclient.A2AClient); ok {
+		if client, ok := cached.(*a2aclientv2.Client); ok {
 			a2aClient = client
 		}
 	}
 
 	// Create new client if not cached
 	if a2aClient == nil {
-		// Build A2A client options with authentication propagation
-		a2aOpts := []a2aclient.Option{
-			a2aclient.WithTimeout(h.a2aTimeout),
-			a2aclient.WithHTTPReqHandler(
-				authimpl.A2ARequestHandler(
-					h.authenticator,
-					agentNns,
-				),
-			),
+		httpClient := &http.Client{Timeout: h.a2aTimeout}
+		resolver := agentcard.NewResolver(httpClient)
+		card, err := resolver.Resolve(ctx, a2aURL)
+		if err != nil {
+			log.Error(err, "Failed to resolve A2A card", "agent", agentRef)
+			return &mcpsdk.CallToolResult{
+				Content: []mcpsdk.Content{
+					&mcpsdk.TextContent{Text: fmt.Sprintf("Failed to resolve A2A card: %v", err)},
+				},
+				IsError: true,
+			}, InvokeAgentOutput{}, nil
 		}
-
-		newClient, err := a2aclient.NewA2AClient(a2aURL, a2aOpts...)
+		newClient, err := a2aclientv2.NewFromCard(
+			ctx,
+			card,
+			a2aclientv2.WithJSONRPCTransport(httpClient),
+			a2aclientv2.WithCallInterceptors(
+				a2a.NewUpstreamAuthInterceptor(h.authenticator, agentNns),
+				a2a.NewStaticHeadersInterceptor(map[string]string{"A2A-Version": string(a2atype.Version)}),
+			),
+		)
 		if err != nil {
 			log.Error(err, "Failed to create A2A client", "agent", agentRef)
 			return &mcpsdk.CallToolResult{
@@ -258,15 +245,9 @@ func (h *MCPHandler) handleInvokeAgent(ctx context.Context, req *mcpsdk.CallTool
 		a2aClient = newClient
 	}
 
-	// Send message via A2A
-	result, err := a2aClient.SendMessage(ctx, protocol.SendMessageParams{
-		Message: protocol.Message{
-			Kind:      protocol.KindMessage,
-			Role:      protocol.MessageRoleUser,
-			ContextID: contextIDPtr,
-			Parts:     []protocol.Part{protocol.NewTextPart(input.Task)},
-		},
-	})
+	message := a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart(input.Task))
+	message.ContextID = input.ContextID
+	result, err := a2aClient.SendMessage(ctx, &a2atype.SendMessageRequest{Message: message})
 	if err != nil {
 		log.Error(err, "Failed to send A2A message", "agent", agentRef)
 		return &mcpsdk.CallToolResult{
@@ -279,25 +260,22 @@ func (h *MCPHandler) handleInvokeAgent(ctx context.Context, req *mcpsdk.CallTool
 
 	// Extract response text and context ID
 	var responseText, newContextID string
-	switch a2aResult := result.Result.(type) {
-	case *protocol.Message:
-		responseText = a2a.ExtractText(*a2aResult)
-		if a2aResult.ContextID != nil {
-			newContextID = *a2aResult.ContextID
-		}
-	// Kagent A2A only returns Task type for now
-	case *protocol.Task:
+	switch a2aResult := result.(type) {
+	case *a2atype.Message:
+		responseText = a2a.ExtractText(a2aResult)
+		newContextID = a2aResult.ContextID
+	case *a2atype.Task:
 		newContextID = a2aResult.ContextID
 		if a2aResult.Status.Message != nil {
-			responseText = a2a.ExtractText(*a2aResult.Status.Message)
+			responseText = a2a.ExtractText(a2aResult.Status.Message)
 		}
 		for _, artifact := range a2aResult.Artifacts {
-			responseText += a2a.ExtractText(protocol.Message{Parts: artifact.Parts})
+			responseText += a2a.ExtractText(&a2atype.Message{Parts: artifact.Parts})
 		}
 	}
 
 	if responseText == "" {
-		raw, err := result.MarshalJSON()
+		raw, err := json.Marshal(result)
 		if err != nil {
 			return &mcpsdk.CallToolResult{
 				Content: []mcpsdk.Content{
