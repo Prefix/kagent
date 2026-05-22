@@ -210,7 +210,10 @@ def test_sse_params_get_factory_when_supported():
         tls_ca_cert_path="/etc/ssl/certs/custom/corp-ca/ca.crt",
     )
 
-    if not hasattr(SseConnectionParams, "model_fields") or "httpx_client_factory" not in SseConnectionParams.model_fields:
+    if (
+        not hasattr(SseConnectionParams, "model_fields")
+        or "httpx_client_factory" not in SseConnectionParams.model_fields
+    ):
         pytest.skip("installed google-adk lacks httpx_client_factory on SSE — upgrade to ≥ 1.28.1")
 
     with mock.patch("kagent.adk.types.create_ssl_context", return_value=object()):
