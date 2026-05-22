@@ -29,6 +29,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -68,25 +69,28 @@ type mockmcpFixture struct {
 func setupMockMCP(t *testing.T, withTLS bool, opts mockmcp.Options) *mockmcpFixture {
 	t.Helper()
 
-	// Bind ephemerally so concurrent tests don't fight for ports.
+	// Bind on all interfaces so the controller pod (inside kind) can
+	// reach the listener via the kind-network gateway IP. Binding to
+	// "127.0.0.1:0" rejects connections from outside the loopback
+	// interface, which is what kind pod traffic looks like after
+	// routing through the network gateway. Ephemeral port still keeps
+	// concurrent tests from fighting.
 	if opts.Addr == "" {
-		opts.Addr = "127.0.0.1:0"
+		opts.Addr = ":0"
 	}
 	opts.RecordRequests = true
 
 	var caPEM []byte
 	if withTLS {
-		// Mint a self-signed CA + server cert. SANs include
-		// host.docker.internal and the Docker-bridge IP so the
-		// certificate validates whichever host alias the in-cluster
-		// pod ends up using.
-		certPEM, keyPEM, ca := generateSelfSignedCert(t, []string{
-			"localhost",
-			"host.docker.internal",
-		}, []net.IP{
-			net.ParseIP("127.0.0.1"),
-			net.ParseIP("172.17.0.1"),
-		})
+		// Mint a self-signed CA + server cert. SANs must include
+		// whichever host alias / IP the in-cluster pod ends up
+		// dialing — that varies by network setup:
+		//   * Mac without override: host.docker.internal (DNS)
+		//   * Linux Docker default bridge: 172.17.0.1
+		//   * kind on Linux: kind network gateway (often 172.18.0.1)
+		//     — passed via KAGENT_LOCAL_HOST in CI
+		dnsNames, ips := certSubjectAltNames()
+		certPEM, keyPEM, ca := generateSelfSignedCert(t, dnsNames, ips)
 		opts.CertPEM = certPEM
 		opts.KeyPEM = keyPEM
 		caPEM = ca
@@ -130,6 +134,36 @@ func schemeOf(rawURL string) string {
 		return "https"
 	}
 	return "http"
+}
+
+// certSubjectAltNames returns the DNS-name and IP SAN lists for the
+// mockmcp self-signed cert. Mirrors buildK8sURL's host-selection
+// logic so the cert validates the same host the controller actually
+// dials. Includes liberal fallbacks (kind default + Docker default)
+// so the local-dev path doesn't require an explicit env override.
+func certSubjectAltNames() ([]string, []net.IP) {
+	dns := []string{"localhost", "host.docker.internal"}
+	ips := []net.IP{
+		net.ParseIP("127.0.0.1"),
+		net.ParseIP("172.17.0.1"), // Docker default bridge
+		net.ParseIP("172.18.0.1"), // common kind gateway
+	}
+
+	// KAGENT_LOCAL_HOST is the dynamic gateway IP CI detects from
+	// `docker network inspect kind`. Include it as a SAN so the
+	// controller's TLS verification accepts whatever IP the runner
+	// happens to have allocated. buildK8sURL's OS-default fallbacks
+	// (host.docker.internal on darwin, 172.17.0.1 on linux) are
+	// already covered by the static DNS/IP lists above.
+	if override := os.Getenv("KAGENT_LOCAL_HOST"); override != "" {
+		if ip := net.ParseIP(override); ip != nil {
+			ips = append(ips, ip)
+		} else {
+			dns = append(dns, override)
+		}
+	}
+
+	return dns, ips
 }
 
 // createCASecret writes the CA PEM produced by setupMockMCP into a
