@@ -294,15 +294,16 @@ type TLSConfig struct {
 
 	// CACertSecretRef is a reference to a Kubernetes Secret containing
 	// CA certificate(s) in PEM format. The Secret must be in the same
-	// namespace as the ModelConfig.
-	// When set, the certificate will be used to verify the provider's SSL certificate.
-	// This field follows the same pattern as APIKeySecret.
+	// namespace as the resource referencing it (ModelConfig,
+	// RemoteMCPServer, or any future consumer of TLSConfig).
+	// When set, the certificate will be used to verify the upstream's
+	// SSL certificate.
 	// +optional
 	CACertSecretRef string `json:"caCertSecretRef,omitempty"`
 
-	// CACertSecretKey is the key within the Secret that contains the CA certificate data.
-	// This field follows the same pattern as APIKeySecretKey.
-	// Required when CACertSecretRef is set (unless DisableVerify is true).
+	// CACertSecretKey is the key within the Secret that contains the
+	// CA certificate data (PEM-encoded). Required when CACertSecretRef
+	// is set (unless DisableVerify is true).
 	// +optional
 	CACertSecretKey string `json:"caCertSecretKey,omitempty"`
 

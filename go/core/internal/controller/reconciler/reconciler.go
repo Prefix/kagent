@@ -1130,7 +1130,7 @@ func (a *kagentReconciler) buildRemoteMCPServerTLSConfig(ctx context.Context, s 
 // requests. When tlsConfig is non-nil it's installed on a cloned
 // transport so tool discovery honors RemoteMCPServer.spec.tls.
 func newHTTPClient(headers map[string]string, timeout time.Duration, tlsConfig *tls.Config) *http.Client {
-	var base http.RoundTripper = http.DefaultTransport
+	var base = http.DefaultTransport
 	if tlsConfig != nil {
 		// Clone the default transport to preserve its dial/keepalive
 		// settings (proxies, dual-stack, HTTP/2) and override only the

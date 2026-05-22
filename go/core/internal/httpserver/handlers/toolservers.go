@@ -170,6 +170,10 @@ func (h *ToolServersHandler) handleCreateRemoteMCPServer(w ErrorResponseWriter, 
 		"toolServerName", toolRef.Name,
 		"toolServerNamespace", toolRef.Namespace,
 	)
+	if err := Check(h.Authorizer, r, auth.Resource{Type: "ToolServer", Name: toolRef.String()}); err != nil {
+		w.RespondWithError(err)
+		return
+	}
 
 	if err := h.KubeClient.Create(r.Context(), toolServerRequest); err != nil {
 		w.RespondWithError(errors.NewInternalServerError("Failed to create RemoteMCPServer in Kubernetes", err))

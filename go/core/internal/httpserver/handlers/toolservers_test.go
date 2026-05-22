@@ -27,8 +27,21 @@ import (
 	"github.com/kagent-dev/kagent/go/core/internal/httpserver/auth"
 	"github.com/kagent-dev/kagent/go/core/internal/httpserver/handlers"
 	common "github.com/kagent-dev/kagent/go/core/internal/utils"
+	pkgauth "github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"github.com/kagent-dev/kmcp/api/v1alpha1"
 )
+
+// denyAuthorizer satisfies pkgauth.Authorizer by refusing every Check.
+// Used to pin the authorization gate on the create endpoints: a request
+// from an unauthorized caller must surface a 403 BEFORE the handler
+// reaches KubeClient.Create or createOrUpdateCompanionSecrets.
+type denyAuthorizer struct{}
+
+func (denyAuthorizer) Check(_ context.Context, _ pkgauth.Principal, _ pkgauth.Verb, _ pkgauth.Resource) error {
+	return assert.AnError
+}
+
+var _ pkgauth.Authorizer = denyAuthorizer{}
 
 func TestToolServersHandler(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -562,6 +575,83 @@ func TestToolServersHandler(t *testing.T) {
 				ctrl_client.ObjectKey{Namespace: "default", Name: "stranger"}, fresh)
 			require.NoError(t, err)
 			assert.Equal(t, []byte("OLD"), fresh.Data["ca.crt"])
+		})
+
+		// AuthorizationRequired_RemoteMCPServer pins the authz gate on the
+		// RMS create path. A caller the authorizer rejects must get a 403
+		// AND no RMS, no companion Secret should land in the cluster.
+		t.Run("AuthorizationRequired_RemoteMCPServer", func(t *testing.T) {
+			handler, kubeClient, _, responseRecorder := setupHandler(t)
+			// Swap the Noop authorizer for one that denies every Check.
+			handler.Authorizer = denyAuthorizer{}
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "RemoteMCPServer",
+				RemoteMCPServer: &v1alpha2.RemoteMCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "denied-rms", Namespace: "default"},
+					Spec: v1alpha2.RemoteMCPServerSpec{
+						Description: "should not be created",
+						URL:         "https://x/y",
+					},
+				},
+				Secrets: []api.SecretMaterial{
+					{Name: "denied-rms-ca", Key: "ca.crt", Value: "PEM"},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "unauthorized-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+
+			assert.Equal(t, http.StatusForbidden, responseRecorder.Code,
+				"unauthorized RMS create must surface 403")
+			// Neither the RMS nor the companion Secret should have been
+			// created — the authz gate fires before any KubeClient.Create.
+			rms := &v1alpha2.RemoteMCPServer{}
+			err := kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "denied-rms"}, rms)
+			assert.Error(t, err, "denied request must not create the RemoteMCPServer")
+			secret := &corev1.Secret{}
+			err = kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "denied-rms-ca"}, secret)
+			assert.Error(t, err, "denied request must not create the companion Secret")
+		})
+
+		// AuthorizationRequired_MCPServer pins the symmetric authz gate
+		// on the kmcp MCPServer create path, so a regression on either
+		// branch surfaces in the test suite.
+		t.Run("AuthorizationRequired_MCPServer", func(t *testing.T) {
+			handler, kubeClient, _, responseRecorder := setupHandler(t)
+			handler.Authorizer = denyAuthorizer{}
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "MCPServer",
+				MCPServer: &v1alpha1.MCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "denied-mcp", Namespace: "default"},
+					Spec: v1alpha1.MCPServerSpec{
+						Deployment: v1alpha1.MCPServerDeployment{
+							Image: "example/kmcp:latest",
+							Port:  8080,
+							Cmd:   "/bin/serve",
+						},
+					},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "unauthorized-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+
+			assert.Equal(t, http.StatusForbidden, responseRecorder.Code,
+				"unauthorized MCPServer create must surface 403")
+			mcp := &v1alpha1.MCPServer{}
+			err := kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "denied-mcp"}, mcp)
+			assert.Error(t, err, "denied request must not create the MCPServer")
 		})
 
 		t.Run("ToolServerAlreadyExists", func(t *testing.T) {

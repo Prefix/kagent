@@ -415,7 +415,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		openai.BaseModel.TLSInsecureSkipVerify, openai.BaseModel.TLSCACertPath, openai.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		openai.TLSInsecureSkipVerify, openai.TLSCACertPath, openai.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		// Populate TokenExchange fields (OpenAI-specific)
 		addTokenExchangeConfiguration(openai, modelDeploymentData, &model.Spec)
 		openai.APIKeyPassthrough = model.Spec.APIKeyPassthrough
@@ -473,7 +473,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		anthropic.BaseModel.TLSInsecureSkipVerify, anthropic.BaseModel.TLSCACertPath, anthropic.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		anthropic.TLSInsecureSkipVerify, anthropic.TLSCACertPath, anthropic.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		anthropic.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		if model.Spec.Anthropic != nil {
@@ -522,7 +522,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		azureOpenAI.BaseModel.TLSInsecureSkipVerify, azureOpenAI.BaseModel.TLSCACertPath, azureOpenAI.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		azureOpenAI.TLSInsecureSkipVerify, azureOpenAI.TLSCACertPath, azureOpenAI.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		azureOpenAI.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return azureOpenAI, modelDeploymentData, secretHashBytes, nil
@@ -567,7 +567,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		gemini.BaseModel.TLSInsecureSkipVerify, gemini.BaseModel.TLSCACertPath, gemini.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		gemini.TLSInsecureSkipVerify, gemini.TLSCACertPath, gemini.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		gemini.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return gemini, modelDeploymentData, secretHashBytes, nil
@@ -608,7 +608,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		anthropic.BaseModel.TLSInsecureSkipVerify, anthropic.BaseModel.TLSCACertPath, anthropic.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		anthropic.TLSInsecureSkipVerify, anthropic.TLSCACertPath, anthropic.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		anthropic.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return anthropic, modelDeploymentData, secretHashBytes, nil
@@ -632,7 +632,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			Options: model.Spec.Ollama.Options,
 		}
 		// Populate TLS fields in BaseModel
-		ollama.BaseModel.TLSInsecureSkipVerify, ollama.BaseModel.TLSCACertPath, ollama.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		ollama.TLSInsecureSkipVerify, ollama.TLSCACertPath, ollama.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		ollama.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return ollama, modelDeploymentData, secretHashBytes, nil
@@ -655,7 +655,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			},
 		}
 		// Populate TLS fields in BaseModel
-		gemini.BaseModel.TLSInsecureSkipVerify, gemini.BaseModel.TLSCACertPath, gemini.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		gemini.TLSInsecureSkipVerify, gemini.TLSCACertPath, gemini.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		return gemini, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderBedrock:
 		if model.Spec.Bedrock == nil {
@@ -743,7 +743,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 		}
 
 		// Populate TLS fields in BaseModel
-		bedrock.BaseModel.TLSInsecureSkipVerify, bedrock.BaseModel.TLSCACertPath, bedrock.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		bedrock.TLSInsecureSkipVerify, bedrock.TLSCACertPath, bedrock.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		bedrock.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return bedrock, modelDeploymentData, secretHashBytes, nil
@@ -792,7 +792,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 			AuthUrl:       model.Spec.SAPAICore.AuthURL,
 		}
 
-		sapAICore.BaseModel.TLSInsecureSkipVerify, sapAICore.BaseModel.TLSCACertPath, sapAICore.BaseModel.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
+		sapAICore.TLSInsecureSkipVerify, sapAICore.TLSCACertPath, sapAICore.TLSDisableSystemCAs = deriveTLSFields(model.Spec.TLS)
 		sapAICore.APIKeyPassthrough = model.Spec.APIKeyPassthrough
 
 		return sapAICore, modelDeploymentData, secretHashBytes, nil

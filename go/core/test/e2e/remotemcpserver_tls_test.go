@@ -29,6 +29,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,11 +53,11 @@ import (
 // mock LLM.
 type mockmcpFixture struct {
 	server      *mockmcp.Server
-	baseURL     string  // dial URL from inside the cluster
-	mcpURL      string  // dial URL with the /mcp path appended
-	sseURL      string  // dial URL with the /sse path appended
-	caCertPEM   []byte  // when TLS, the PEM bundle to install as a Secret (nil for plaintext fixtures)
-	hostBindURL string  // local 127.0.0.1 URL for debug logging — NOT the cluster-facing URL
+	baseURL     string // dial URL from inside the cluster
+	mcpURL      string // dial URL with the /mcp path appended
+	sseURL      string // dial URL with the /sse path appended
+	caCertPEM   []byte // when TLS, the PEM bundle to install as a Secret (nil for plaintext fixtures)
+	hostBindURL string // local 127.0.0.1 URL for debug logging — NOT the cluster-facing URL
 }
 
 // setupMockMCP starts a mockmcp fixture. When withTLS is true a fresh
@@ -102,7 +103,12 @@ func setupMockMCP(t *testing.T, withTLS bool, opts mockmcp.Options) *mockmcpFixt
 		_ = server.Stop(ctx)
 	})
 
-	clusterURL := buildK8sURL(hostURL)
+	// buildK8sURL hard-codes "http://" — fine for the mockllm path it
+	// was written for, but mockmcp's TLS scenarios serve HTTPS and the
+	// scheme must round-trip to the controller's dial config. Reuse
+	// buildK8sURL to pick the right host (kind gateway IP / docker
+	// alias), then restore the actual scheme mockmcp listened on.
+	clusterURL := strings.Replace(buildK8sURL(hostURL), "http://", schemeOf(hostURL)+"://", 1)
 
 	return &mockmcpFixture{
 		server:      server,
@@ -112,6 +118,18 @@ func setupMockMCP(t *testing.T, withTLS bool, opts mockmcp.Options) *mockmcpFixt
 		caCertPEM:   caPEM,
 		hostBindURL: hostURL,
 	}
+}
+
+// schemeOf returns "http" or "https" depending on the URL's prefix.
+// Used by setupMockMCP to preserve mockmcp's actual listening scheme
+// when buildK8sURL rewrites the host (which it does by string-edit,
+// not by url.Parse, so it can't be asked to preserve the scheme
+// itself without changing its signature for one caller).
+func schemeOf(rawURL string) string {
+	if strings.HasPrefix(rawURL, "https://") {
+		return "https"
+	}
+	return "http"
 }
 
 // createCASecret writes the CA PEM produced by setupMockMCP into a
@@ -223,15 +241,15 @@ func generateSelfSignedCert(t *testing.T, dnsNames []string, ips []net.IP) (cert
 	require.NoError(t, err)
 
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      pkix.Name{CommonName: "kagent-e2e-mockmcp"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     dnsNames,
-		IPAddresses:  ips,
-		IsCA:         true,
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: "kagent-e2e-mockmcp"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:              dnsNames,
+		IPAddresses:           ips,
+		IsCA:                  true,
 		BasicConstraintsValid: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
