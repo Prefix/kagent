@@ -44,7 +44,18 @@ export function newOpenClawChannelRow(): OpenClawChannelRow {
   };
 }
 
+export type HarnessRuntimeForm = "openshell" | "substrate";
+
 export interface OpenClawSandboxFormSlice {
+  /** Harness control plane: OpenShell (default) or Agent Substrate. */
+  runtime: HarnessRuntimeForm;
+  /** Use an existing Substrate WorkerPool or let kagent create one per harness. */
+  substrateWorkerPoolMode: "create" | "existing";
+  substrateWorkerPoolRefNamespace: string;
+  substrateWorkerPoolRefName: string;
+  substrateWorkerPoolReplicas: string;
+  /** GCS snapshot prefix (gs://bucket/path/) — required for auto-provisioned templates. */
+  substrateSnapshotsLocation: string;
   /** Optional override for Sandbox.spec.image (OpenShell VM template image). Empty → controller default. */
   image: string;
   channels: OpenClawChannelRow[];
@@ -59,6 +70,12 @@ export interface OpenClawSandboxFormSlice {
 
 export function defaultOpenClawSandboxFormSlice(): OpenClawSandboxFormSlice {
   return {
+    runtime: "openshell",
+    substrateWorkerPoolMode: "create",
+    substrateWorkerPoolRefNamespace: "",
+    substrateWorkerPoolRefName: "",
+    substrateWorkerPoolReplicas: "2",
+    substrateSnapshotsLocation: "gs://ate-snapshots/kagent/",
     image: "",
     channels: [],
     allowedDomains: "",
@@ -311,10 +328,39 @@ export function buildSandboxCRDraft(args: {
     channels.push(base);
   }
 
+  const runtime = args.openClaw.runtime?.trim() || "openshell";
+
   const spec: Record<string, unknown> = {
     backend: SANDBOX_BACKEND_OPENCLAW,
+    runtime,
     modelConfigRef,
   };
+
+  if (runtime === "substrate") {
+    const snapshots = args.openClaw.substrateSnapshotsLocation?.trim();
+    if (!snapshots) {
+      return { error: "Substrate snapshots location (gs://…) is required." };
+    }
+    const substrate: Record<string, unknown> = {
+      snapshotsConfig: { location: snapshots },
+    };
+    if (args.openClaw.substrateWorkerPoolMode === "existing") {
+      const wpName = args.openClaw.substrateWorkerPoolRefName?.trim();
+      if (!wpName) {
+        return { error: "WorkerPool name is required when using an existing pool." };
+      }
+      substrate.workerPoolRef = {
+        name: wpName,
+        namespace: args.openClaw.substrateWorkerPoolRefNamespace?.trim() || args.namespace.trim(),
+      };
+    } else {
+      const replicas = Number.parseInt(args.openClaw.substrateWorkerPoolReplicas?.trim() || "2", 10);
+      substrate.workerPool = {
+        replicas: Number.isFinite(replicas) && replicas > 0 ? replicas : 2,
+      };
+    }
+    spec.substrate = substrate;
+  }
 
   const desc = args.description.trim();
   if (desc) {

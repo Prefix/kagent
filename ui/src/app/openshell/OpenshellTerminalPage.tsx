@@ -40,9 +40,9 @@ export function OpenshellTerminalPage() {
 
   const gatewaySandboxName = searchParams.get("sandbox")?.trim() ?? "";
   const clawHarnessSession = searchParams.get("clawHarness") === "1";
-  const autoConnect = Boolean(gatewaySandboxName);
   const namespace = searchParams.get("ns")?.trim() ?? "";
   const crName = searchParams.get("name")?.trim() ?? "";
+  const autoConnect = Boolean(gatewaySandboxName);
   const modelConfigRef = searchParams.get("modelConfigRef")?.trim() ?? "";
   const [plainShellOnly, setPlainShellOnly] = useState(() => searchParams.get("plainShell") === "1");
   /** Plain-shell mode the active SSH session was opened with (null when disconnected). */
@@ -53,7 +53,7 @@ export function OpenshellTerminalPage() {
 
   const [termError, setTermError] = useState<string | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
-  const [connecting, setConnecting] = useState(() => Boolean(autoConnect && gatewaySandboxName));
+  const [connecting, setConnecting] = useState(() => Boolean(autoConnect));
 
   const termHostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -108,16 +108,10 @@ export function OpenshellTerminalPage() {
     wsRef.current?.close();
   }, []);
 
-  const connectTerminal = useCallback(
-    (gatewayName: string) => {
+  const connectTerminal = useCallback(() => {
       const term = termRef.current;
       if (!term) {
         setConnecting(false);
-        return;
-      }
-      const name = gatewayName.trim();
-      if (!name) {
-        setTermError("Missing gateway sandbox name.");
         return;
       }
 
@@ -126,7 +120,22 @@ export function OpenshellTerminalPage() {
       setSessionActive(false);
       wsRef.current?.close();
 
-      const url = sandboxSshWebSocketURL(terminalApiBase());
+      const name = gatewaySandboxName.trim();
+      if (!name) {
+        setConnecting(false);
+        setTermError("Missing gateway sandbox name.");
+        return;
+      }
+
+      const apiBase = terminalApiBase();
+      const url = sandboxSshWebSocketURL(apiBase);
+      const startPayload: Record<string, unknown> = {
+        sandbox_name: name,
+        plain_shell: plainShellOnly,
+        cols: term.cols,
+        rows: term.rows,
+      };
+
       let ws: WebSocket;
       try {
         ws = new WebSocket(url);
@@ -145,14 +154,7 @@ export function OpenshellTerminalPage() {
         setTermError(null);
         setAppliedPlainShell(plainShellOnly);
         term.reset();
-        ws.send(
-          JSON.stringify({
-            sandbox_name: name,
-            plain_shell: plainShellOnly,
-            cols: term.cols,
-            rows: term.rows,
-          }),
-        );
+        ws.send(JSON.stringify(startPayload));
       };
 
       ws.onmessage = (ev) => {
@@ -192,24 +194,22 @@ export function OpenshellTerminalPage() {
         }
       };
     },
-    [plainShellOnly],
+    [plainShellOnly, namespace, crName, gatewaySandboxName],
   );
 
   const restartSession = useCallback(() => {
-    const name = gatewaySandboxName.trim();
-    if (!name) return;
     wsRef.current?.close();
-    window.setTimeout(() => connectTerminal(name), 120);
-  }, [gatewaySandboxName, connectTerminal]);
+    window.setTimeout(() => connectTerminal(), 120);
+  }, [connectTerminal]);
 
   useEffect(() => {
-    if (!autoConnect || !gatewaySandboxName) return;
+    if (!autoConnect) return;
     const t = window.setTimeout(() => {
       if (!termRef.current) return;
-      connectTerminal(gatewaySandboxName);
+      connectTerminal();
     }, 400);
     return () => window.clearTimeout(t);
-  }, [autoConnect, gatewaySandboxName, connectTerminal]);
+  }, [autoConnect, connectTerminal]);
 
   const showReconnect = Boolean(gatewaySandboxName) && !sessionActive && !connecting;
   const plainShellPendingRestart =
@@ -266,7 +266,7 @@ export function OpenshellTerminalPage() {
           ) : null}
           <div className="flex flex-wrap justify-end gap-2">
             {showReconnect ? (
-              <Button type="button" size="sm" variant="secondary" onClick={() => connectTerminal(gatewaySandboxName)}>
+              <Button type="button" size="sm" variant="secondary" onClick={() => connectTerminal()}>
                 Reconnect
               </Button>
             ) : null}
@@ -286,8 +286,7 @@ export function OpenshellTerminalPage() {
 
       {!gatewaySandboxName ? (
         <p className="text-sm text-muted-foreground">
-          Open an OpenShell sandbox from the <span className="text-foreground">Agents</span> list to start a terminal
-          session.
+          Open a harness from the <span className="text-foreground">Agents</span> list to start a terminal session.
         </p>
       ) : null}
 

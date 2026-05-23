@@ -19,7 +19,11 @@ import { k8sRefUtils } from "@/lib/k8sUtils";
 import { cn } from "@/lib/utils";
 import { ArrowDown, ArrowUp, Brain, MoreHorizontal, Pencil, Terminal, Trash2 } from "lucide-react";
 import { agentHarnessTypeLabel, getAgentHarnessBackend, isAgentHarness } from "@/lib/agentHarness";
-import { isOpenshellSandboxRow, openshellTerminalHref } from "@/lib/openshellSandboxAgents";
+import {
+  isOpenshellSandboxRow,
+  isSubstrateHarnessRow,
+  openshellTerminalHref,
+} from "@/lib/openshellSandboxAgents";
 
 interface AgentListViewProps {
   agentResponse: AgentResponse[];
@@ -216,6 +220,7 @@ function AgentListRow({ item }: { item: AgentResponse }) {
   const [deleteOpen, setDeleteOpen] = useState(false);
 
   const sshSandbox = isOpenshellSandboxRow(item);
+  const substrateHarness = isSubstrateHarnessRow(item);
   const agentHarness = isAgentHarness(item);
   const harnessBackend = getAgentHarnessBackend(item);
 
@@ -227,16 +232,19 @@ function AgentListRow({ item }: { item: AgentResponse }) {
   const nTools = countAgentToolBindings(item);
   const nSkills = countSkills(agent);
 
+  const substrateGatewayPath = item.substrateAgentHarness?.gatewayUIPath;
   const chatPath =
-    sshSandbox && item.openshellAgentHarness
-      ? openshellTerminalHref({
-          gatewaySandboxName: item.openshellAgentHarness.gatewaySandboxName,
-          namespace,
-          crName: name,
-          modelConfigRef: item.modelConfigRef,
-          clawHarness: agentHarness,
-        })
-      : `/agents/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/chat`;
+    substrateHarness && substrateGatewayPath
+      ? substrateGatewayPath
+      : sshSandbox && item.openshellAgentHarness
+        ? openshellTerminalHref({
+            gatewaySandboxName: item.openshellAgentHarness.gatewaySandboxName,
+            namespace,
+            crName: name,
+            modelConfigRef: item.modelConfigRef,
+            clawHarness: agentHarness,
+          })
+        : `/agents/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/chat`;
   const goChat = useCallback(() => {
     if (isReady) {
       router.push(chatPath);
