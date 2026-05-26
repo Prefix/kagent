@@ -72,15 +72,10 @@ func (a *adkApiTranslator) BuildManifest(
 	}
 
 	// Build the pod template with a placeholder config-hash. The real
-	// hash is computed and stamped after plugins run (see below): a
-	// plugin that mutates the config Secret needs the hash to reflect
-	// the mutation so pods roll on the next reconcile. buildPodTemplate
-	// initializes the Annotations map by reference; the post-plugin
-	// stamp writes into that same map, which workloadObjects share via
-	// Go's map-reference semantics — so the stamp propagates to
-	// whichever workload type buildWorkloadObjects produced (Deployment
-	// in normal mode, Sandbox in sandbox mode) without the translator
-	// needing to know about the workload's concrete type.
+	// hash is computed and stamped onto each workload's pod template
+	// after plugins run (see below): a plugin that mutates the config
+	// Secret needs the hash to reflect the mutation so pods roll on the
+	// next reconcile.
 	podTemplate := buildPodTemplate(manifestCtx, podRuntime, 0)
 
 	workloadObjects, err := a.buildWorkloadObjects(ctx, manifestCtx, podTemplate)
@@ -102,14 +97,40 @@ func (a *adkApiTranslator) BuildManifest(
 		return outputs, err
 	}
 
-	// Stamp the post-plugin config-hash. The mutation propagates to
-	// every workload object that embedded podTemplate, since their
-	// pod-template Annotations map is the same reference as
-	// podTemplate.Annotations (see buildPodTemplate).
+	// Stamp the post-plugin config-hash explicitly onto every workload
+	// object in the manifest. Walking outputs.Manifest is structural —
+	// it survives a plugin that reassigns or defensively clones the
+	// PodTemplateSpec.Annotations map, which would silently break a
+	// shared-reference scheme. New workload types only need a case in
+	// stampConfigHashOnWorkloads (or, for backend-emitted kinds, an
+	// implementation of Backend.StampPodTemplateAnnotation) for the
+	// hash to flow through.
 	configHash := computeHashFromConfigSecret(configSecret.secret, inputs.SecretHashBytes)
-	podTemplate.Annotations["kagent.dev/config-hash"] = fmt.Sprintf("%d", configHash)
+	a.stampConfigHashOnWorkloads(outputs.Manifest, configHash)
 
 	return outputs, nil
+}
+
+// stampConfigHashOnWorkloads walks the translated manifest and sets the
+// kagent.dev/config-hash annotation on every workload object's pod
+// template. Deployments are stamped here directly; sandbox-backend kinds
+// delegate to the backend so this file stays independent of the
+// agent-sandbox CRD type.
+func (a *adkApiTranslator) stampConfigHashOnWorkloads(manifest []client.Object, configHash uint64) {
+	const key = "kagent.dev/config-hash"
+	value := fmt.Sprintf("%d", configHash)
+	for _, obj := range manifest {
+		if d, ok := obj.(*appsv1.Deployment); ok {
+			if d.Spec.Template.Annotations == nil {
+				d.Spec.Template.Annotations = map[string]string{}
+			}
+			d.Spec.Template.Annotations[key] = value
+			continue
+		}
+		if a.sandboxBackend != nil && a.sandboxBackend.StampPodTemplateAnnotation(obj, key, value) {
+			continue
+		}
+	}
 }
 
 func newManifestContext(agent v1alpha2.AgentObject, dep *resolvedDeployment) manifestContext {

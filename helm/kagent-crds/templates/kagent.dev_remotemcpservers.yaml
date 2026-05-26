@@ -321,6 +321,12 @@ spec:
                   Important: Run "make" to regenerate code after modifying this file
                 format: int64
                 type: integer
+              secretHash:
+                description: |-
+                  SecretHash stores a hash of the TLS Secret referenced by spec.tls so
+                  agents that consume this RemoteMCPServer can detect cert rotation and
+                  roll on the next reconcile. Empty when spec.tls.caCertSecretRef is unset.
+                type: string
             type: object
         type: object
     served: true

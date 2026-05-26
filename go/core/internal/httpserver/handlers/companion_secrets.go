@@ -7,6 +7,7 @@ import (
 	"maps"
 	"strings"
 
+	"github.com/go-logr/logr"
 	api "github.com/kagent-dev/kagent/go/api/httpapi"
 	"github.com/kagent-dev/kagent/go/core/internal/httpserver/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -31,6 +32,23 @@ func companionSecretAPIError(err error) *errors.APIError {
 		return errors.NewBadRequestError(err.Error(), err)
 	}
 	return errors.NewInternalServerError("Failed to create or update companion secrets", err)
+}
+
+// rollbackOwnerOnCompanionSecretFailure deletes the owner resource the
+// caller just created when the companion-Secret pass that follows fails.
+// Use it to close the partial-failure window where the owner is in K8s
+// but its referenced Secrets aren't — the operator's retry of the same
+// POST would otherwise hit AlreadyExists on the owner without realizing
+// the prior attempt half-succeeded. Best-effort: a delete failure is
+// logged via the caller's logger but does not change the outer error;
+// the caller already surfaces the companion-Secret error to the client.
+func rollbackOwnerOnCompanionSecretFailure(ctx context.Context, kubeClient client.Client, owner client.Object, log logr.Logger) {
+	if err := kubeClient.Delete(ctx, owner); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "failed to roll back owner after companion-secret failure",
+			"kind", owner.GetObjectKind().GroupVersionKind().Kind,
+			"namespace", owner.GetNamespace(),
+			"name", owner.GetName())
+	}
 }
 
 // validateSecretMaterials checks each SecretMaterial's name and key
@@ -140,17 +158,24 @@ func ownerReferenceFor(owner client.Object, gvk schema.GroupVersionKind) metav1.
 }
 
 // isOwnedBy reports whether the secret carries an OwnerReference back
-// to the named owner of the given GVK. UID is compared when the owner
-// has one (so unit tests that build owners without a live UID still
-// match by name+kind, which is the intended semantic).
+// to the given owner. Compares APIVersion, Kind, Name, AND UID — the UID
+// match is load-bearing because a delete-recreate of an owner with the
+// same name issues a fresh UID, and the prior owner's secrets may still
+// be visible through K8s GC's deletion delay. Requires a non-empty UID
+// on the caller's owner; in production K8s always populates this after
+// Create, so a zero UID here means a programming error (calling the
+// helper before persisting the owner).
 func isOwnedBy(secret *corev1.Secret, owner client.Object, gvk schema.GroupVersionKind) bool {
+	if owner.GetUID() == "" {
+		return false
+	}
 	for _, ownerRef := range secret.GetOwnerReferences() {
 		if ownerRef.APIVersion != gvk.GroupVersion().Identifier() ||
 			ownerRef.Kind != gvk.Kind ||
 			ownerRef.Name != owner.GetName() {
 			continue
 		}
-		if owner.GetUID() != "" && ownerRef.UID != owner.GetUID() {
+		if ownerRef.UID != owner.GetUID() {
 			continue
 		}
 		return true

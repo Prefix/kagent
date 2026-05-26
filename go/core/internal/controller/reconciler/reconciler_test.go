@@ -683,6 +683,91 @@ func TestValidateCrossNamespaceReferences(t *testing.T) {
 	}
 }
 
+// TestComputeRemoteMCPServerSecretHash pins the controller-side shape of
+// the RMS TLS-Secret hash: the empty string when no TLS Secret is
+// referenced, a deterministic hex string when one is, and a different
+// hex string after the Secret contents rotate. Agents fold this value
+// into their config-hash so an in-place cert rotation triggers a
+// rollout (the Python ADK loads the cert at startup, so without a
+// rollout pods keep the stale trust chain in memory).
+func TestComputeRemoteMCPServerSecretHash(t *testing.T) {
+	scheme := clientgoscheme.Scheme
+	require.NoError(t, v1alpha2.AddToScheme(scheme))
+
+	caV1 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "corp-ca", Namespace: "ns"},
+		Data:       map[string][]byte{"ca.crt": []byte("PEM-V1")},
+	}
+	caV2 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "corp-ca", Namespace: "ns"},
+		Data:       map[string][]byte{"ca.crt": []byte("PEM-V2")},
+	}
+
+	rmsNoTLS := &v1alpha2.RemoteMCPServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns"},
+		Spec:       v1alpha2.RemoteMCPServerSpec{URL: "https://x/y"},
+	}
+	rmsWithTLS := &v1alpha2.RemoteMCPServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns"},
+		Spec: v1alpha2.RemoteMCPServerSpec{
+			URL: "https://x/y",
+			TLS: &v1alpha2.TLSConfig{CACertSecretRef: "corp-ca", CACertSecretKey: "ca.crt"},
+		},
+	}
+
+	t.Run("no TLS → empty hash", func(t *testing.T) {
+		kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &kagentReconciler{kube: kube}
+		hash, err := r.computeRemoteMCPServerSecretHash(context.Background(), rmsNoTLS)
+		require.NoError(t, err)
+		assert.Empty(t, hash)
+	})
+
+	t.Run("missing secret → error", func(t *testing.T) {
+		kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &kagentReconciler{kube: kube}
+		_, err := r.computeRemoteMCPServerSecretHash(context.Background(), rmsWithTLS)
+		require.Error(t, err)
+	})
+
+	t.Run("missing key in present secret → error", func(t *testing.T) {
+		// Secret exists but has the wrong key — the operator typo'd
+		// caCertSecretKey. Without this guard the agent would mount
+		// the Secret, fail to find the file at startup, and produce a
+		// FileNotFoundError that doesn't identify the resource owner.
+		// Surfacing the error on the RMS's Accepted condition gives
+		// the operator a precise pointer.
+		wrongKey := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "corp-ca", Namespace: "ns"},
+			Data:       map[string][]byte{"other.crt": []byte("PEM")},
+		}
+		kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wrongKey).Build()
+		r := &kagentReconciler{kube: kube}
+		_, err := r.computeRemoteMCPServerSecretHash(context.Background(), rmsWithTLS)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ca.crt")
+	})
+
+	t.Run("present secret → stable hex; rotation → different hex", func(t *testing.T) {
+		kube1 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(caV1.DeepCopy()).Build()
+		kube2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(caV2.DeepCopy()).Build()
+		r1 := &kagentReconciler{kube: kube1}
+		r2 := &kagentReconciler{kube: kube2}
+
+		h1, err := r1.computeRemoteMCPServerSecretHash(context.Background(), rmsWithTLS)
+		require.NoError(t, err)
+		require.NotEmpty(t, h1)
+
+		h1Again, err := r1.computeRemoteMCPServerSecretHash(context.Background(), rmsWithTLS)
+		require.NoError(t, err)
+		assert.Equal(t, h1, h1Again, "same Secret content must produce identical hash")
+
+		h2, err := r2.computeRemoteMCPServerSecretHash(context.Background(), rmsWithTLS)
+		require.NoError(t, err)
+		assert.NotEqual(t, h1, h2, "rotating the Secret content must change the hash")
+	})
+}
+
 // TestRemoteMCPRegistrationTimeout verifies that remoteMCPRegistrationTimeout
 // returns spec.timeout when set and falls back to the package default otherwise.
 func TestRemoteMCPRegistrationTimeout(t *testing.T) {

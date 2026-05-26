@@ -25,4 +25,11 @@ type Backend interface {
 
 	// ComputeReady reflects implementation-specific status into condition pieces for Agent.status.
 	ComputeReady(ctx context.Context, cl client.Client, nn types.NamespacedName) (status metav1.ConditionStatus, reason, message string)
+
+	// StampPodTemplateAnnotation sets the given annotation on the
+	// backend's workload pod template, returning true if obj is a kind
+	// the backend produces. Used by the agent translator to stamp the
+	// post-plugin config-hash without needing to import the backend's
+	// concrete CRD types.
+	StampPodTemplateAnnotation(obj client.Object, key, value string) bool
 }

@@ -88,6 +88,21 @@ func mapsUnion(podLabels map[string]string, agentLabels map[string]string) map[s
 	return out
 }
 
+// StampPodTemplateAnnotation sets key=value on the Sandbox's pod-template
+// annotations. Returns false for objects that aren't Sandboxes so the
+// caller can fall through to its other workload kinds.
+func (b *Backend) StampPodTemplateAnnotation(obj client.Object, key, value string) bool {
+	sb, ok := obj.(*agentsandboxv1.Sandbox)
+	if !ok {
+		return false
+	}
+	if sb.Spec.PodTemplate.ObjectMeta.Annotations == nil {
+		sb.Spec.PodTemplate.ObjectMeta.Annotations = map[string]string{}
+	}
+	sb.Spec.PodTemplate.ObjectMeta.Annotations[key] = value
+	return true
+}
+
 func (b *Backend) ComputeReady(ctx context.Context, cl client.Client, nn types.NamespacedName) (metav1.ConditionStatus, string, string) {
 	sb := &agentsandboxv1.Sandbox{}
 	if err := cl.Get(ctx, nn, sb); err != nil {

@@ -284,6 +284,14 @@ func deriveTLSFields(tlsConfig *v1alpha2.TLSConfig) (insecureSkipVerify *bool, c
 //     RemoteMCPServer path (translateRemoteMCPServerTarget) appends directly to the
 //     already-merged modelDeploymentData rather than through
 //     mergeDeploymentData.
+//
+// Spec validation (Secret exists, named key present) is the reconciler's
+// job for both ModelConfig and RemoteMCPServer — see the TLS branches of
+// ReconcileKagentModelConfig and ReconcileKagentRemoteMCPServer. The
+// translator trusts that the Status has already surfaced any
+// misconfiguration; mounting an absent key here would crash the agent at
+// startup, but the operator gets the early signal on the resource's own
+// Accepted condition.
 func addTLSConfiguration(modelDeploymentData *modelDeploymentData, tlsConfig *v1alpha2.TLSConfig) {
 	if tlsConfig == nil {
 		return
@@ -867,7 +875,7 @@ func (a *adkApiTranslator) translateSseHttpTool(ctx context.Context, server *v1a
 	return params, nil
 }
 
-func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, mdd *modelDeploymentData, agentNamespace string, toolServer *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
+func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, mdd *modelDeploymentData, agentNamespace string, toolServer *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) ([]byte, error) {
 	gvk := toolServer.GroupKind()
 
 	switch gvk {
@@ -890,12 +898,12 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 
 		err := a.kube.Get(ctx, mcpServerRef, mcpServer)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		remoteMcpServer, err := ConvertMCPServerToRemoteMCPServer(mcpServer)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		return a.translateRemoteMCPServerTarget(ctx, agent, mdd, remoteMcpServer, toolServer, agentHeaders, proxyURL)
@@ -914,7 +922,7 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 
 		err := a.kube.Get(ctx, remoteMcpServerRef, remoteMcpServer)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		// RemoteMCPServer uses user-supplied URLs, but if the URL points to an internal k8s service,
@@ -939,26 +947,26 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 
 		err := a.kube.Get(ctx, svcRef, svc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		remoteMcpServer, err := ConvertServiceToRemoteMCPServer(svc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		return a.translateRemoteMCPServerTarget(ctx, agent, mdd, remoteMcpServer, toolServer, agentHeaders, proxyURL)
 	default:
-		return fmt.Errorf("unknown tool server type: %s", gvk)
+		return nil, fmt.Errorf("unknown tool server type: %s", gvk)
 	}
 }
 
-func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, mdd *modelDeploymentData, remoteMcpServer *v1alpha2.RemoteMCPServer, mcpServerTool *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
+func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, mdd *modelDeploymentData, remoteMcpServer *v1alpha2.RemoteMCPServer, mcpServerTool *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) ([]byte, error) {
 	switch remoteMcpServer.Spec.Protocol {
 	case v1alpha2.RemoteMCPServerProtocolSse:
 		tool, err := a.translateSseHttpTool(ctx, remoteMcpServer, agentHeaders, proxyURL)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		agent.SseTools = append(agent.SseTools, adk.SseMcpServerConfig{
 			Params:          *tool,
@@ -969,7 +977,7 @@ func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, a
 	default:
 		tool, err := a.translateStreamableHttpTool(ctx, remoteMcpServer, agentHeaders, proxyURL)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		agent.HttpTools = append(agent.HttpTools, adk.HttpMcpServerConfig{
 			Params:          *tool,
@@ -980,11 +988,31 @@ func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, a
 	}
 	// Mount the CA Secret on the agent pod when the RemoteMCPServer pins a TLS bundle.
 	// Converters that synthesize RMSs from in-cluster MCPServer/Service
-	// references don't set Spec.TLS, so this is a no-op for those.
+	// references don't set Spec.TLS, so this is a no-op for those. Returns
+	// the controller-resolved TLS Secret hash so callers can mix it into
+	// the agent's config hash — that's the signal that drives a rollout
+	// when the CA Secret rotates in place (same Secret name, new PEM).
 	if mdd != nil {
 		addTLSConfiguration(mdd, remoteMcpServer.Spec.TLS)
 	}
-	return nil
+	return remoteMCPServerSecretHashBytes(remoteMcpServer), nil
+}
+
+// remoteMCPServerSecretHashBytes returns the hex-decoded bytes of the
+// RMS's Status.SecretHash so the agent translator can fold them into the
+// agent's config hash. Returns nil (no contribution, no error) when the
+// status hash is empty or malformed — the controller is responsible for
+// keeping Status.SecretHash in sync, and a transient missing/garbage
+// value should not block agent translation.
+func remoteMCPServerSecretHashBytes(remoteMcpServer *v1alpha2.RemoteMCPServer) []byte {
+	if remoteMcpServer == nil || remoteMcpServer.Status.SecretHash == "" {
+		return nil
+	}
+	decoded, err := hex.DecodeString(remoteMcpServer.Status.SecretHash)
+	if err != nil {
+		return nil
+	}
+	return decoded
 }
 
 // Helper functions

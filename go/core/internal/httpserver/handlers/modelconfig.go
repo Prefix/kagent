@@ -188,6 +188,11 @@ func (h *ModelConfigHandler) HandleCreateModelConfig(w ErrorResponseWriter, r *h
 
 	if err := createOrUpdateCompanionSecrets(r.Context(), h.KubeClient, modelConfig, modelConfigGVK, req.Secrets); err != nil {
 		log.Error(err, "Failed to create or update companion secrets")
+		// Close the partial-failure window: the ModelConfig is in K8s
+		// but its companion Secrets aren't. The operator's retry would
+		// otherwise hit AlreadyExists on the ModelConfig without a hint
+		// that the prior attempt half-succeeded.
+		rollbackOwnerOnCompanionSecretFailure(r.Context(), h.KubeClient, modelConfig, log)
 		w.RespondWithError(companionSecretAPIError(err))
 		return
 	}

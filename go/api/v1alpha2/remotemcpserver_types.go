@@ -102,6 +102,11 @@ type RemoteMCPServerStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// +optional
 	DiscoveredTools []*MCPTool `json:"discoveredTools,omitempty"`
+	// SecretHash stores a hash of the TLS Secret referenced by spec.tls so
+	// agents that consume this RemoteMCPServer can detect cert rotation and
+	// roll on the next reconcile. Empty when spec.tls.caCertSecretRef is unset.
+	// +optional
+	SecretHash string `json:"secretHash,omitempty"`
 }
 
 type MCPTool struct {

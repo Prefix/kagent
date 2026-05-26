@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -575,6 +576,60 @@ func TestToolServersHandler(t *testing.T) {
 				ctrl_client.ObjectKey{Namespace: "default", Name: "stranger"}, fresh)
 			require.NoError(t, err)
 			assert.Equal(t, []byte("OLD"), fresh.Data["ca.crt"])
+
+			// Companion-secret failure must roll back the RMS so the
+			// operator's retry doesn't hit AlreadyExists. Pins the
+			// partial-failure fix; without rollback the orphan would
+			// be readable here.
+			orphan := &v1alpha2.RemoteMCPServer{}
+			err = kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "stranger-rms"}, orphan)
+			assert.True(t, apierrors.IsNotFound(err),
+				"RMS must be rolled back when companion-secret creation fails; got err=%v", err)
+		})
+
+		// CompanionSecretFailure_RollsBackMCPServer pins the symmetric
+		// rollback behavior on the kmcp MCPServer create path so a
+		// regression on either branch surfaces in CI.
+		t.Run("CompanionSecretFailure_RollsBackMCPServer", func(t *testing.T) {
+			handler, kubeClient, _, responseRecorder := setupHandler(t)
+
+			preexisting := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "stranger-kmcp", Namespace: "default"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"x": []byte("OLD")},
+			}
+			require.NoError(t, kubeClient.Create(context.Background(), preexisting))
+
+			reqBody := &handlers.ToolServerCreateRequest{
+				Type: "MCPServer",
+				MCPServer: &v1alpha1.MCPServer{
+					ObjectMeta: metav1.ObjectMeta{Name: "stranger-mcp", Namespace: "default"},
+					Spec: v1alpha1.MCPServerSpec{
+						Deployment: v1alpha1.MCPServerDeployment{
+							Image: "example/kmcp:latest",
+							Port:  8080,
+							Cmd:   "/bin/serve",
+						},
+					},
+				},
+				Secrets: []api.SecretMaterial{
+					{Name: "stranger-kmcp", Key: "x", Value: "NEW"},
+				},
+			}
+			jsonBody, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest("POST", "/api/toolservers/", bytes.NewBuffer(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req = setUser(req, "test-user")
+
+			handler.HandleCreateToolServer(responseRecorder, req)
+			assert.Equal(t, http.StatusBadRequest, responseRecorder.Code)
+
+			orphan := &v1alpha1.MCPServer{}
+			err := kubeClient.Get(context.Background(),
+				ctrl_client.ObjectKey{Namespace: "default", Name: "stranger-mcp"}, orphan)
+			assert.True(t, apierrors.IsNotFound(err),
+				"MCPServer must be rolled back when companion-secret creation fails; got err=%v", err)
 		})
 
 		// AuthorizationRequired_RemoteMCPServer pins the authz gate on the

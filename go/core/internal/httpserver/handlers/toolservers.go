@@ -128,11 +128,6 @@ func (h *ToolServersHandler) HandleCreateToolServer(w ErrorResponseWriter, r *ht
 		return
 	}
 
-	if err := validateSecretMaterials(toolServerRequest.Secrets); err != nil {
-		w.RespondWithError(errors.NewBadRequestError(err.Error(), err))
-		return
-	}
-
 	switch toolServerRequest.Type {
 	case ToolServerTypeRemoteMCPServer:
 		if toolServerRequest.RemoteMCPServer == nil {
@@ -175,6 +170,14 @@ func (h *ToolServersHandler) handleCreateRemoteMCPServer(w ErrorResponseWriter, 
 		return
 	}
 
+	// validateSecretMaterials runs after authz so an unauthorized caller
+	// gets 403 regardless of payload shape — keeps the error surface
+	// dependent only on authz, not on request structure.
+	if err := validateSecretMaterials(secrets); err != nil {
+		w.RespondWithError(errors.NewBadRequestError(err.Error(), err))
+		return
+	}
+
 	if err := h.KubeClient.Create(r.Context(), toolServerRequest); err != nil {
 		w.RespondWithError(errors.NewInternalServerError("Failed to create RemoteMCPServer in Kubernetes", err))
 		return
@@ -182,6 +185,11 @@ func (h *ToolServersHandler) handleCreateRemoteMCPServer(w ErrorResponseWriter, 
 
 	if err := createOrUpdateCompanionSecrets(r.Context(), h.KubeClient, toolServerRequest, remoteMCPServerGVK, secrets); err != nil {
 		log.Error(err, "Failed to create or update companion secrets")
+		// Close the partial-failure window: the RMS is already in K8s
+		// but its companion Secrets aren't. Leaving it would force the
+		// operator to delete-then-retry on a confusing 500 AlreadyExists
+		// on the next POST. Roll back, surface the original error.
+		rollbackOwnerOnCompanionSecretFailure(r.Context(), h.KubeClient, toolServerRequest, log)
 		w.RespondWithError(companionSecretAPIError(err))
 		return
 	}
@@ -215,6 +223,11 @@ func (h *ToolServersHandler) handleCreateMCPServer(w ErrorResponseWriter, r *htt
 		return
 	}
 
+	if err := validateSecretMaterials(secrets); err != nil {
+		w.RespondWithError(errors.NewBadRequestError(err.Error(), err))
+		return
+	}
+
 	if err := h.KubeClient.Create(r.Context(), toolServerRequest); err != nil {
 		w.RespondWithError(errors.NewInternalServerError("Failed to create MCPServer in Kubernetes", err))
 		return
@@ -222,6 +235,7 @@ func (h *ToolServersHandler) handleCreateMCPServer(w ErrorResponseWriter, r *htt
 
 	if err := createOrUpdateCompanionSecrets(r.Context(), h.KubeClient, toolServerRequest, mcpServerGVK, secrets); err != nil {
 		log.Error(err, "Failed to create or update companion secrets")
+		rollbackOwnerOnCompanionSecretFailure(r.Context(), h.KubeClient, toolServerRequest, log)
 		w.RespondWithError(companionSecretAPIError(err))
 		return
 	}

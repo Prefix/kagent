@@ -522,3 +522,77 @@ func Test_AdkApiTranslator_RMSTLS_CoexistsWithModelConfigTLS(t *testing.T) {
 	assert.Len(t, tlsVolumeNames, 3, "Three TLS Secrets must produce three distinct volume names")
 	assert.Len(t, tlsMountPaths, 3, "Three TLS Secrets must produce three distinct mount paths")
 }
+
+// Test_AdkApiTranslator_RMSTLS_SecretHashChangesAgentConfigHash pins the
+// cert-rotation behavior: an in-place rotation of the RMS TLS Secret
+// (same Secret name, new PEM, status SecretHash flipped by the
+// controller) must change the agent's kagent.dev/config-hash so the
+// deployment rolls. Without this, agent pods retain the old cert loaded
+// at process startup via ssl.create_default_context.
+func Test_AdkApiTranslator_RMSTLS_SecretHashChangesAgentConfigHash(t *testing.T) {
+	scheme := schemev1.Scheme
+	require.NoError(t, v1alpha2.AddToScheme(scheme))
+
+	build := func(rmsHash string) string {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rotate-test"}}
+		caSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "corp-ca", Namespace: "rotate-test"},
+			Data:       map[string][]byte{"ca.crt": []byte("FAKE CA PEM")},
+		}
+		modelConfig := &v1alpha2.ModelConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "rotate-test"},
+			Spec:       v1alpha2.ModelConfigSpec{Model: "gpt-4o", Provider: v1alpha2.ModelProviderOpenAI},
+		}
+		rms := &v1alpha2.RemoteMCPServer{
+			ObjectMeta: metav1.ObjectMeta{Name: "corp-upstream", Namespace: "rotate-test"},
+			Spec: v1alpha2.RemoteMCPServerSpec{
+				Description: "Corp upstream",
+				URL:         "https://mcp.corp.internal/mcp",
+				TLS: &v1alpha2.TLSConfig{
+					CACertSecretRef: "corp-ca",
+					CACertSecretKey: "ca.crt",
+				},
+			},
+			Status: v1alpha2.RemoteMCPServerStatus{SecretHash: rmsHash},
+		}
+		agent := &v1alpha2.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "rotate-test"},
+			Spec: v1alpha2.AgentSpec{
+				Type:        v1alpha2.AgentType_Declarative,
+				Description: "Agent",
+				Declarative: &v1alpha2.DeclarativeAgentSpec{
+					SystemMessage: "System",
+					ModelConfig:   "model",
+					Tools: []*v1alpha2.Tool{{
+						Type: v1alpha2.ToolProviderType_McpServer,
+						McpServer: &v1alpha2.McpServerTool{
+							TypedReference: v1alpha2.TypedReference{
+								Kind: "RemoteMCPServer", ApiGroup: "kagent.dev", Name: "corp-upstream",
+							},
+						},
+					}},
+				},
+			},
+		}
+
+		kube := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(ns, caSecret, modelConfig, rms, agent).
+			Build()
+		trans := translator.NewAdkApiTranslator(
+			kube,
+			types.NamespacedName{Namespace: "rotate-test", Name: "model"},
+			nil, "", nil,
+		)
+		outputs, err := translator.TranslateAgent(context.Background(), trans, agent)
+		require.NoError(t, err)
+		dep := findDeployment(t, outputs)
+		return dep.Spec.Template.Annotations["kagent.dev/config-hash"]
+	}
+
+	preRotate := build("deadbeef")
+	postRotate := build("cafef00d")
+	assert.NotEqual(t, preRotate, postRotate,
+		"agent config-hash must change when RMS Status.SecretHash rotates")
+}
+

@@ -437,6 +437,18 @@ func (a *kagentReconciler) ReconcileKagentModelConfig(ctx context.Context, req c
 		if kubeErr := a.kube.Get(ctx, namespacedName, secret); kubeErr != nil {
 			err = multierror.Append(err, fmt.Errorf("failed to get secret %s: %w", modelConfig.Spec.TLS.CACertSecretRef, kubeErr))
 		} else {
+			// Surface the misconfiguration on the ModelConfig's Accepted
+			// condition: mounting an absent key would crash the agent at
+			// startup with FileNotFoundError without explaining which
+			// resource owns the bad reference. Translation still proceeds
+			// using whatever path the spec derived — agents fail loudly
+			// at startup, which matches the existing "missing-Secret"
+			// surface above.
+			if modelConfig.Spec.TLS.CACertSecretKey != "" {
+				if _, ok := secret.Data[modelConfig.Spec.TLS.CACertSecretKey]; !ok {
+					err = multierror.Append(err, fmt.Errorf("tls secret %s does not contain key %q", modelConfig.Spec.TLS.CACertSecretRef, modelConfig.Spec.TLS.CACertSecretKey))
+				}
+			}
 			secrets = append(secrets, secretRef{
 				NamespacedName: namespacedName,
 				Secret:         secret,
@@ -604,6 +616,15 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 		GroupKind:   server.GroupVersionKind().GroupKind().String(),
 	}
 
+	// Compute the TLS-Secret hash before tool discovery so the status
+	// reflects the operator's current spec.tls.caCertSecretRef contents.
+	// Agents that mount this Secret read the hash from Status.SecretHash
+	// at translate time so an in-place cert rotation triggers a rollout
+	// even when the Secret name (and therefore the cert path) didn't
+	// change. Missing-Secret errors are folded into the registration
+	// error path so a misconfigured RMS still surfaces a Failed condition.
+	secretHash, secretErr := a.computeRemoteMCPServerSecretHash(ctx, server)
+
 	l.Info("registering remote MCP server", "url", server.Spec.URL, "protocol", server.Spec.Protocol)
 	start := time.Now()
 	tools, err := a.upsertToolServerForRemoteMCPServer(ctx, dbServer, server)
@@ -619,12 +640,16 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 	} else {
 		l.Info("successfully registered remote MCP server", "url", server.Spec.URL, "toolCount", len(tools), "duration", time.Since(start))
 	}
+	if secretErr != nil {
+		err = multierror.Append(err, secretErr)
+	}
 
 	// update the tool server status as the agents depend on it
 	if err := a.reconcileRemoteMCPServerStatus(
 		ctx,
 		server,
 		tools,
+		secretHash,
 		err,
 	); err != nil {
 		return fmt.Errorf("failed to reconcile remote mcp server status %s: %w", req.NamespacedName, err)
@@ -633,10 +658,37 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 	return nil
 }
 
+// computeRemoteMCPServerSecretHash returns a hash over the TLS Secret
+// referenced by spec.tls.caCertSecretRef, matching the shape used by
+// ModelConfig's secret hash so agents can detect cert rotation. Returns
+// the empty string (no error) when no TLS Secret is referenced. Also
+// validates that the named key exists in the Secret so the operator
+// gets a clear Accepted=false on the RMS rather than a startup crash
+// (FileNotFoundError from the Python ADK) on every consuming agent —
+// mirrors the equivalent check in ReconcileKagentModelConfig.
+func (a *kagentReconciler) computeRemoteMCPServerSecretHash(ctx context.Context, server *v1alpha2.RemoteMCPServer) (string, error) {
+	tlsSpec := server.Spec.TLS
+	if tlsSpec == nil || tlsSpec.CACertSecretRef == "" {
+		return "", nil
+	}
+	secret := &corev1.Secret{}
+	nn := types.NamespacedName{Namespace: server.Namespace, Name: tlsSpec.CACertSecretRef}
+	if err := a.kube.Get(ctx, nn, secret); err != nil {
+		return "", fmt.Errorf("failed to get TLS secret %s: %w", tlsSpec.CACertSecretRef, err)
+	}
+	if tlsSpec.CACertSecretKey != "" {
+		if _, ok := secret.Data[tlsSpec.CACertSecretKey]; !ok {
+			return "", fmt.Errorf("tls secret %s does not contain key %q", tlsSpec.CACertSecretRef, tlsSpec.CACertSecretKey)
+		}
+	}
+	return computeStatusSecretHash([]secretRef{{NamespacedName: nn, Secret: secret}}), nil
+}
+
 func (a *kagentReconciler) reconcileRemoteMCPServerStatus(
 	ctx context.Context,
 	server *v1alpha2.RemoteMCPServer,
 	discoveredTools []*v1alpha2.MCPTool,
+	secretHash string,
 	err error,
 ) error {
 	var (
@@ -664,12 +716,14 @@ func (a *kagentReconciler) reconcileRemoteMCPServerStatus(
 	// only update if the status has changed to prevent looping the reconciler
 	if !conditionChanged &&
 		server.Status.ObservedGeneration == server.Generation &&
+		server.Status.SecretHash == secretHash &&
 		reflect.DeepEqual(server.Status.DiscoveredTools, discoveredTools) {
 		return nil
 	}
 
 	server.Status.ObservedGeneration = server.Generation
 	server.Status.DiscoveredTools = discoveredTools
+	server.Status.SecretHash = secretHash
 
 	if err := a.kube.Status().Update(ctx, server); err != nil {
 		return fmt.Errorf("failed to update remote mcp server status: %w", err)
